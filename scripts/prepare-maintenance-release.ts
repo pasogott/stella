@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { Result } from "better-result";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -305,15 +306,68 @@ const assertCleanWorktree = () => {
   }
 };
 
+/** Runs a command and returns its stdout; null when it does not run. */
+export type CommandOutput = (command: readonly string[]) => string | null;
+
+const nonEmptyToken = (value: string | null | undefined): string | null =>
+  value === undefined || value === null || value.length === 0 ? null : value;
+
+// The reads go to github.com, so the token has to be that host's. A bare
+// `gh auth token` answers for the CLI's default host, which is an Enterprise
+// instance wherever the operator's GH_HOST points at one.
+const GH_TOKEN_COMMAND = [
+  "gh",
+  "auth",
+  "token",
+  "--hostname",
+  "github.com",
+] as const;
+
+// `gh` may be absent, or present and signed out of github.com. Both mean the
+// same thing here: no token, and the reads below go out unauthenticated.
+const spawnOutput: CommandOutput = (command) => {
+  const spawned = Result.try(() =>
+    Bun.spawnSync([...command], {
+      cwd: ROOT_DIR,
+      stderr: "pipe",
+      stdout: "pipe",
+    }),
+  );
+  return Result.isError(spawned) || !spawned.value.success
+    ? null
+    : spawned.value.stdout.toString();
+};
+
+/**
+ * Token the GitHub reads are made with.
+ *
+ * The variables come first, since a workflow sets them. The signed-in CLI
+ * stands behind them so a local run is not left to the anonymous rate limit,
+ * which answers a release preparation with HTTP 403.
+ */
+export const resolveGitHubToken = (
+  env: Record<string, string | undefined>,
+  runCommand: CommandOutput = spawnOutput,
+): string | null =>
+  nonEmptyToken(env["GH_TOKEN"]) ??
+  nonEmptyToken(env["GITHUB_TOKEN"]) ??
+  nonEmptyToken(runCommand(GH_TOKEN_COMMAND)?.trim());
+
+// Resolved once: one preparation makes a page of reads, and asking the CLI
+// per read would spawn it as many times.
+let resolvedToken: string | null | undefined;
+
 const requestGitHub = async (path: string): Promise<Response> => {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "stella-maintenance-release",
     "X-GitHub-Api-Version": "2022-11-28",
   };
-  const token = process.env["GH_TOKEN"] ?? process.env["GITHUB_TOKEN"];
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
+  if (resolvedToken === undefined) {
+    resolvedToken = resolveGitHubToken(process.env);
+  }
+  if (resolvedToken !== null) {
+    headers["Authorization"] = `Bearer ${resolvedToken}`;
   }
   return fetch(`${GITHUB_API_ROOT}${path}`, { headers });
 };
