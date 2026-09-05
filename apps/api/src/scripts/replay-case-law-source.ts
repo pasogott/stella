@@ -38,6 +38,7 @@ import { caseLawSources } from "@/api/db/schema";
  */
 import { getAdapter } from "@/api/handlers/case-law/ingestion/adapters/adapter-registry";
 import {
+  acquireReplayLease,
   CASE_LAW_REPLAY_SCOPE,
   countReplayability,
   REPLAY_REJECTION_POLICY,
@@ -64,6 +65,8 @@ const { ingestionDb } = await enterCaseLawMaintenanceLane();
 
 const DEFAULT_LIMIT = 100;
 const DEFAULT_PAGE_SIZE = 25;
+const DEFAULT_LEASE_WAIT_MINUTES = 30;
+const MINUTE_MS = 60_000;
 /** A stored payload is one document; nothing here should take longer. */
 const STORED_RAW_READ_TIMEOUT_MS = 30_000;
 
@@ -82,7 +85,11 @@ const USAGE = `Usage: bun run src/scripts/replay-case-law-source.ts --adapter <k
   --celex <value>   Replay only the decision stored under this publisher id
                     (metadata.celex).
   --after <id>      Resume strictly after this decision id.
-  --page-size <n>   Rows read per query (default ${DEFAULT_PAGE_SIZE}).`;
+  --page-size <n>   Rows read per query (default ${DEFAULT_PAGE_SIZE}).
+  --lease-wait <minutes>
+                    How long an --apply run waits for the source's ingestion
+                    lease before giving up (default ${DEFAULT_LEASE_WAIT_MINUTES}).
+                    0 attempts once and exits if the lease is held.`;
 
 const flagValue = (name: string): string | undefined => {
   const index = process.argv.indexOf(`--${name}`);
@@ -99,17 +106,42 @@ const flagValue = (name: string): string | undefined => {
 
 const hasFlag = (name: string): boolean => process.argv.includes(`--${name}`);
 
-const positiveInteger = (
-  raw: string | undefined,
-  fallback: number,
-  name: string,
-): number => {
+/** Bounds a numeric flag accepts, with the wording its refusal uses. */
+const INTEGER_BOUND = {
+  POSITIVE: { minimum: 1, wording: "a positive integer" },
+  NON_NEGATIVE: { minimum: 0, wording: "a non-negative integer" },
+} as const;
+
+type IntegerBound = (typeof INTEGER_BOUND)[keyof typeof INTEGER_BOUND];
+
+type IntegerFlagOptions = {
+  bound: IntegerBound;
+  fallback: number;
+  name: string;
+  raw: string | undefined;
+};
+
+// The whole value has to be digits. `Number.parseInt` reads a prefix and
+// stops, so "30minutes" would pass as 30 minutes, "0.5" as 0 and "1e3" as 1:
+// every one of them a bound the operator did not ask for.
+const DECIMAL_DIGITS = /^\d+$/u;
+
+const integerFlag = ({
+  bound,
+  fallback,
+  name,
+  raw,
+}: IntegerFlagOptions): number => {
   if (raw === undefined) {
     return fallback;
   }
   const parsed = Number.parseInt(raw, 10);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    console.error(`--${name} must be a positive integer, got: ${raw}`);
+  if (
+    !DECIMAL_DIGITS.test(raw) ||
+    !Number.isSafeInteger(parsed) ||
+    parsed < bound.minimum
+  ) {
+    console.error(`--${name} must be ${bound.wording}, got: ${raw}`);
     process.exit(1);
   }
   return parsed;
@@ -125,12 +157,24 @@ const apply = hasFlag("apply");
 const rejectionPolicy = hasFlag("withdraw-rejected")
   ? REPLAY_REJECTION_POLICY.WITHDRAW_NO_DOCUMENT
   : REPLAY_REJECTION_POLICY.REPORT;
-const limit = positiveInteger(flagValue("limit"), DEFAULT_LIMIT, "limit");
-const pageSize = positiveInteger(
-  flagValue("page-size"),
-  DEFAULT_PAGE_SIZE,
-  "page-size",
-);
+const limit = integerFlag({
+  bound: INTEGER_BOUND.POSITIVE,
+  fallback: DEFAULT_LIMIT,
+  name: "limit",
+  raw: flagValue("limit"),
+});
+const pageSize = integerFlag({
+  bound: INTEGER_BOUND.POSITIVE,
+  fallback: DEFAULT_PAGE_SIZE,
+  name: "page-size",
+  raw: flagValue("page-size"),
+});
+const leaseWaitMinutes = integerFlag({
+  bound: INTEGER_BOUND.NON_NEGATIVE,
+  fallback: DEFAULT_LEASE_WAIT_MINUTES,
+  name: "lease-wait",
+  raw: flagValue("lease-wait"),
+});
 const celex = flagValue("celex");
 const court = flagValue("court");
 if (celex?.length === 0) {
@@ -234,19 +278,34 @@ const readStoredRaw: StoredRawReader = async (key) => {
 // A writing run takes the source's ingestion lease: it allocates observation
 // orders from the same counter a crawl does, and the two must not interleave.
 // A dry run writes nothing and takes nothing.
-const sourceLease = apply
-  ? await acquireCaseLawSourceIngestionLease({
-      scopedDb: ingestionDb,
-      sourceId: source.id,
+const acquisition = apply
+  ? await acquireReplayLease({
+      acquire: async () =>
+        await acquireCaseLawSourceIngestionLease({
+          scopedDb: ingestionDb,
+          sourceId: source.id,
+        }),
+      waitBudgetMs: leaseWaitMinutes * MINUTE_MS,
+      onWaitStart: () => {
+        console.log(
+          `lease held:          waiting up to ${leaseWaitMinutes} min for the running ingestion to release ${adapterKey}`,
+        );
+      },
     })
   : null;
 
-if (apply && sourceLease === null) {
+if (acquisition?.type === "unavailable") {
   console.error(
     `Source ${adapterKey} is being ingested right now (lease held). Retry later.`,
   );
   process.exit(1);
 }
+if (acquisition !== null && acquisition.waitedMs > 0) {
+  console.log(
+    `lease acquired:      after ${String(acquisition.waitedMs / 1000)} s of waiting`,
+  );
+}
+const sourceLease = acquisition?.lease ?? null;
 
 const replayed = await Result.tryPromise({
   try: async () =>
