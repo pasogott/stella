@@ -25,6 +25,7 @@ import type {
 import {
   CORPUS_INDEX_JOB_OPERATION_SQL_VALUES,
   CORPUS_INDEX_JOB_STATUS_SQL_VALUES,
+  CORPUS_INDEX_JOB_SUCCEEDED_SQL_VALUE,
 } from "./corpus-index-jobs";
 import type {
   CorpusIndexJobOperation,
@@ -267,6 +268,8 @@ export const legislationIndexJobs = p.pgTable(
     status: p.varchar({ length: 16 }).notNull().$type<CorpusIndexJobStatus>(),
     contentHash: p.varchar("content_hash", { length: 64 }),
     errorMessage: p.varchar("error_message", { length: 2048 }),
+    /** Why a succeeded operation was performed; see the case-law twin. */
+    detail: p.varchar("detail", { length: 2048 }),
     createdAt: timestamptz("created_at").defaultNow().notNull(),
   },
   (t) => [
@@ -279,6 +282,12 @@ export const legislationIndexJobs = p.pgTable(
     p.check(
       "legislation_index_jobs_status_values",
       sql`${t.status} IN (${sql.join(CORPUS_INDEX_JOB_STATUS_SQL_VALUES, sql.raw(","))})`,
+    ),
+    // The case-law twin's invariant, on the same declaration: a succeeded row
+    // carries no failure.
+    p.check(
+      "legislation_index_jobs_succeeded_error_message",
+      sql`${t.status} <> ${CORPUS_INDEX_JOB_SUCCEEDED_SQL_VALUE} OR ${t.errorMessage} IS NULL`,
     ),
     ...globalCaseLawPolicies(),
   ],

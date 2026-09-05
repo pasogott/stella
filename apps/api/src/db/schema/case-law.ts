@@ -84,6 +84,7 @@ import { workspaces } from "./contacts";
 import {
   CORPUS_INDEX_JOB_OPERATION_SQL_VALUES,
   CORPUS_INDEX_JOB_STATUS_SQL_VALUES,
+  CORPUS_INDEX_JOB_SUCCEEDED_SQL_VALUE,
 } from "./corpus-index-jobs";
 import type {
   CorpusIndexJobOperation,
@@ -2038,6 +2039,13 @@ export const caseLawIndexJobs = p.pgTable(
     status: p.varchar({ length: 16 }).notNull().$type<CorpusIndexJobStatus>(),
     contentHash: p.varchar("content_hash", { length: 64 }),
     errorMessage: p.varchar("error_message", { length: 2048 }),
+    /**
+     * Why a succeeded operation was performed, in the caller's own words.
+     * Separate from `error_message`, which a reader takes as the failure of
+     * the row it sits on: a withdrawal's reason filed there reads as an
+     * operation that failed, which it did not.
+     */
+    detail: p.varchar("detail", { length: 2048 }),
     createdAt: timestamptz("created_at").defaultNow().notNull(),
   },
   (t) => [
@@ -2054,6 +2062,13 @@ export const caseLawIndexJobs = p.pgTable(
     p.check(
       "case_law_index_jobs_status_values",
       sql`${t.status} IN (${sql.join(CORPUS_INDEX_JOB_STATUS_SQL_VALUES, sql.raw(","))})`,
+    ),
+    // A row that succeeded carries no failure; its reason belongs in `detail`.
+    // The reverse is open on purpose: a failed row may record both what it was
+    // for and what went wrong.
+    p.check(
+      "case_law_index_jobs_succeeded_error_message",
+      sql`${t.status} <> ${CORPUS_INDEX_JOB_SUCCEEDED_SQL_VALUE} OR ${t.errorMessage} IS NULL`,
     ),
     ...globalCaseLawPolicies(),
   ],
