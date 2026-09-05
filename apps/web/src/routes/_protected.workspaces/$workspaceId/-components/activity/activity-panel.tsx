@@ -467,7 +467,6 @@ const ActivityAdvancedFilters = ({
                           title: t("errors.actionFailed"),
                           type: "error",
                         });
-                        throw error;
                       });
                     detached(request, "activity-panel.fetch-actors");
                   }}
@@ -673,7 +672,6 @@ const ActivityTimeline = ({
           title: t("errors.actionFailed"),
           type: "error",
         });
-        throw error;
       });
     detached(request, "activity-panel.fetch-next-page");
   };
@@ -1535,7 +1533,7 @@ const SourceName = ({
     case "chat":
       return t("workspaces.overview.activity.sources.chat");
     case "flow":
-      return t("workspaces.overview.activity.sources.flow");
+      return t("common.workflow");
     case "mcp":
       return t("workspaces.overview.activity.sources.mcp");
     default:

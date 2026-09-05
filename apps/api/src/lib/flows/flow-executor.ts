@@ -6,16 +6,28 @@ import { NOTIFICATION_KIND } from "@stll/api-contract/notifications";
 import type { Transaction } from "@/api/db/root";
 import { rootDb } from "@/api/db/root";
 import type { SafeDb, SafeDbError } from "@/api/db/safe-db";
-import { flowRuns, flowRunSteps } from "@/api/db/schema";
+import {
+  entities,
+  flowRuns,
+  flowRunSteps,
+  WORK_OBLIGATION_SOURCE,
+  workspaceMembers,
+} from "@/api/db/schema";
 import { resolveCaching } from "@/api/lib/ai-config";
 import { loadOrgAIConfig } from "@/api/lib/ai-config-loader";
+import { captureError } from "@/api/lib/analytics/capture";
 import { createTanStackAIAnalyticsCallbacks } from "@/api/lib/analytics/tanstack-ai";
-import { createAuditRecorder } from "@/api/lib/audit-log";
-import type { AuditExecutionContext } from "@/api/lib/audit-log";
+import {
+  AUDIT_ACTION,
+  AUDIT_RESOURCE_TYPE,
+  createAuditRecorder,
+} from "@/api/lib/audit-log";
+import type { AuditExecutionContext, AuditRecorder } from "@/api/lib/audit-log";
 import type { SafeId } from "@/api/lib/branded-types";
 import { decryptContent } from "@/api/lib/content-encryption";
 import { markdownToStellaDocx } from "@/api/lib/docx-authoring/from-markdown";
 import { createEntityFromBuffer } from "@/api/lib/entities/create-from-buffer";
+import { TASK_STATUS } from "@/api/lib/entity-constants";
 import { HandlerError } from "@/api/lib/errors/tagged-errors";
 import {
   broadcastFlowRunUpdate,
@@ -57,7 +69,14 @@ import {
   brandPersistedFlowRunId,
   brandPersistedUserId,
 } from "@/api/lib/safe-id-boundaries";
+import { flushEntitySearchRepairs } from "@/api/lib/search/projection-repair-queue";
 import { generateTanStackTextForRole } from "@/api/lib/tanstack-ai-generate";
+import { createTaskEntityHandler } from "@/api/lib/tasks/create-task-entity";
+import { deployedTaskFeatures } from "@/api/lib/tasks/deployment-features";
+import type { TaskDeploymentFeatures } from "@/api/lib/tasks/deployment-features";
+import { lockWorkObligation } from "@/api/lib/work-obligations/lock-work-obligation";
+import { settleWorkObligation } from "@/api/lib/work-obligations/settle-work-obligation";
+import { WORK_OBLIGATION_SOURCE_SETTLEMENT } from "@/api/lib/work-obligations/transitions";
 import { DOCX_MIME_TYPE } from "@/api/mime-types";
 
 /**
@@ -68,6 +87,21 @@ import { DOCX_MIME_TYPE } from "@/api/mime-types";
  */
 
 const FLOW_AI_GENERATION_TIMEOUT_MS = 3 * 60 * 1000;
+
+/**
+ * The value of a step's failable call, or the step failure that carries its
+ * error: the one place a step turns a `Result` into the throw-to-retry the
+ * queue boundary expects.
+ */
+const unwrapOrFlowStepError = <T>(
+  result: Result<T, unknown>,
+  message: string,
+): T => {
+  if (Result.isError(result)) {
+    throw new FlowStepError({ message, cause: result.error });
+  }
+  return result.value;
+};
 
 /** Expected step-execution failure (bad AI output, doc-compile error, etc). */
 export class FlowStepError extends TaggedError("FlowStepError")<{
@@ -95,6 +129,7 @@ export const executeFlowStep = async (
     broadcastUpdate = broadcastFlowRunUpdate,
     createEntity = createEntityFromBuffer,
     loadAIConfig = loadOrgAIConfig,
+    taskFeatures = deployedTaskFeatures(),
   }: {
     /** External model-dispatch boundary; supplied by focused integration tests. */
     generateTextForRole?: typeof generateTanStackTextForRole | undefined;
@@ -105,6 +140,8 @@ export const executeFlowStep = async (
     broadcastUpdate?: typeof broadcastFlowRunUpdate | undefined;
     createEntity?: typeof createEntityFromBuffer | undefined;
     loadAIConfig?: typeof loadOrgAIConfig | undefined;
+    /** Which task features the deployment enables; tests pin it. */
+    taskFeatures?: TaskDeploymentFeatures | undefined;
   } = {},
 ): Promise<void> => {
   const runId = brandPersistedFlowRunId(rawRunId);
@@ -169,14 +206,14 @@ export const executeFlowStep = async (
   switch (stepDef.kind) {
     case "review-gate":
       await pauseAtReviewGate({
-        runId,
+        run,
         stepIndex,
-        workspaceId: run.workspaceId,
+        stepDef,
         organizationId: scope.organizationId,
         actorUserId,
-        flowName: run.definitionSnapshot.name,
         scopedDb,
         broadcastUpdate,
+        taskFeatures,
       });
       return;
     case "ai": {
@@ -560,6 +597,129 @@ export const loadInputDocuments = async (
   );
 };
 
+/**
+ * The audit identity of work a run performs on the actor's behalf: the flow
+ * is the performer, and the trigger says whether a person dispatched it, a
+ * schedule fired it, or an upload started it.
+ */
+const flowRunAuditRecorder = ({
+  run,
+  organizationId,
+  actorUserId,
+}: {
+  run: LoadedRun;
+  organizationId: SafeId<"organization">;
+  actorUserId: SafeId<"user">;
+}): AuditRecorder => {
+  const trigger = ((): AuditExecutionContext["trigger"] => {
+    switch (run.triggerSource.type) {
+      case "manual":
+        return {
+          source: "action",
+          sourceId: run.id,
+          type: "user_dispatch",
+          userId: actorUserId,
+        };
+      case "schedule":
+        return {
+          ownerUserId: actorUserId,
+          source: "flow",
+          sourceId: run.definitionId ?? run.id,
+          type: "schedule",
+        };
+      case "file-upload":
+        return { source: "file-upload", type: "system" };
+      default: {
+        run.triggerSource satisfies never;
+        return panic(`Unhandled trigger source: ${String(run.triggerSource)}`);
+      }
+    }
+  })();
+
+  return createAuditRecorder({
+    execution: {
+      performer: {
+        type: "agent",
+        id: run.definitionId
+          ? `flow:${run.definitionId}`
+          : `flow-run:${run.id}`,
+        name: run.definitionSnapshot.name,
+      },
+      trigger,
+      runId: run.id,
+    },
+    organizationId,
+    workspaceId: run.workspaceId,
+    userId: actorUserId,
+    request: new Request("http://flow-run.internal/"),
+    server: null,
+  });
+};
+
+type ReviewTaskSettlement = keyof typeof WORK_OBLIGATION_SOURCE_SETTLEMENT;
+
+/**
+ * Settle the task a review gate raised once the gate is decided or the run
+ * is cancelled. Under governed workflow the obligation carries the task and
+ * is closed from whatever open status it holds; without it the task alone
+ * records the outcome. A task already closed (or deleted) is left as it is.
+ */
+const settleReviewTask = async ({
+  tx,
+  taskEntityId,
+  workspaceId,
+  actorUserId,
+  action,
+  reason,
+  recordAuditEvent,
+}: {
+  tx: Transaction;
+  taskEntityId: SafeId<"entity">;
+  workspaceId: SafeId<"workspace">;
+  actorUserId: SafeId<"user">;
+  action: ReviewTaskSettlement;
+  reason: string | null;
+  recordAuditEvent: AuditRecorder;
+}): Promise<void> => {
+  const settlement = WORK_OBLIGATION_SOURCE_SETTLEMENT[action];
+  const obligation = await lockWorkObligation(tx, {
+    entityId: taskEntityId,
+    workspaceId,
+  });
+  if (obligation === undefined) {
+    await tx
+      .update(entities)
+      .set({ status: settlement.taskStatus, updatedAt: new Date() })
+      .where(
+        and(
+          eq(entities.id, taskEntityId),
+          eq(entities.workspaceId, workspaceId),
+          eq(entities.kind, "task"),
+          inArray(entities.status, [
+            TASK_STATUS.OPEN,
+            TASK_STATUS.IN_PROGRESS,
+            TASK_STATUS.IN_REVIEW,
+          ]),
+        ),
+      );
+    return;
+  }
+  if (!settlement.from.some((status) => status === obligation.status)) {
+    return;
+  }
+  await settleWorkObligation({
+    tx,
+    entityId: taskEntityId,
+    workspaceId,
+    actorUserId,
+    action,
+    transition: settlement,
+    previousStatus: obligation.status,
+    reason,
+    recordAuditEvent,
+  });
+};
+
 type RunCreateDocumentArgs = {
   stepDef: Extract<FlowStep, { kind: "create-document" }>;
   stepIndex: number;
@@ -590,56 +750,15 @@ const runCreateDocumentStep = async ({
     });
   }
 
-  const docx = await markdownToStellaDocx(markdown);
-  if (Result.isError(docx)) {
-    throw new FlowStepError({
-      message: "The generated content could not be rendered to a document.",
-      cause: docx.error,
-    });
-  }
+  const docx = unwrapOrFlowStepError(
+    await markdownToStellaDocx(markdown),
+    "The generated content could not be rendered to a document.",
+  );
 
-  const trigger = ((): AuditExecutionContext["trigger"] => {
-    switch (run.triggerSource.type) {
-      case "manual":
-        return {
-          source: "action",
-          sourceId: run.id,
-          type: "user_dispatch",
-          userId: actorUserId,
-        };
-      case "schedule":
-        return {
-          ownerUserId: actorUserId,
-          source: "flow",
-          sourceId: run.definitionId ?? run.id,
-          type: "schedule",
-        };
-      case "file-upload":
-        return { source: "file-upload", type: "system" };
-      default: {
-        run.triggerSource satisfies never;
-        return panic(`Unhandled trigger source: ${String(run.triggerSource)}`);
-      }
-    }
-  })();
-
-  const recordAuditEvent = createAuditRecorder({
-    execution: {
-      performer: {
-        type: "agent",
-        id: run.definitionId
-          ? `flow:${run.definitionId}`
-          : `flow-run:${run.id}`,
-        name: run.definitionSnapshot.name,
-      },
-      trigger,
-      runId: run.id,
-    },
+  const recordAuditEvent = flowRunAuditRecorder({
+    run,
     organizationId,
-    workspaceId: run.workspaceId,
-    userId: actorUserId,
-    request: new Request("http://flow-run.internal/"),
-    server: null,
+    actorUserId,
   });
 
   const created = await createEntity({
@@ -648,7 +767,7 @@ const runCreateDocumentStep = async ({
     workspaceId: run.workspaceId,
     userId: actorUserId,
     recordAuditEvent,
-    buffer: docx.value,
+    buffer: docx,
     // Pass the raw title: `createEntityFromBuffer` sanitizes with
     // `sanitizeFilenamePreservingExtension`, which truncates the base name
     // rather than the extension. Pre-sanitizing with the plain
@@ -658,15 +777,12 @@ const runCreateDocumentStep = async ({
     mimeType: DOCX_MIME_TYPE,
   });
 
-  if (Result.isError(created)) {
-    throw new FlowStepError({
-      message:
-        "The document could not be created for this workspace (entity limit reached or missing file property).",
-      cause: created.error,
-    });
-  }
+  const document = unwrapOrFlowStepError(
+    created,
+    "The document could not be created for this workspace (entity limit reached or missing file property).",
+  );
 
-  return { kind: "create-document", entityId: created.value.entityId };
+  return { kind: "create-document", entityId: document.entityId };
 };
 
 // ── Shared transition writers ───────────────────────────
@@ -779,29 +895,132 @@ const flowRunCompletedNotification = ({
   idempotencyKey: `flow-run-completed:${runId}`,
 });
 
+/**
+ * Raise the task a review gate hands its reviewer. A manual run's launcher is
+ * a member of the matter; the author of an automated definition need not be
+ * a member of every matter its trigger reaches. The task can only be
+ * assigned to a member, so an outside author gets an unassigned task and the
+ * bell notification the gate sends anyway.
+ */
+const raiseReviewTask = async ({
+  tx,
+  run,
+  stepDef,
+  actorUserId,
+  features,
+  recordAuditEvent,
+}: {
+  tx: Transaction;
+  run: LoadedRun;
+  stepDef: Extract<FlowStep, { kind: "review-gate" }>;
+  actorUserId: SafeId<"user">;
+  features: TaskDeploymentFeatures;
+  recordAuditEvent: AuditRecorder;
+}): Promise<SafeId<"entity">> => {
+  const workspaceId = run.workspaceId;
+  const membership = await tx
+    .select({ userId: workspaceMembers.userId })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, actorUserId),
+      ),
+    )
+    .limit(1);
+  const actorIsMember = membership.length > 0;
+  const task = await Result.gen(() =>
+    createTaskEntityHandler({
+      tx,
+      workspaceId,
+      userId: actorUserId,
+      recordAuditEvent,
+      body: {
+        name: `${run.definitionSnapshot.name} · ${stepDef.name}`,
+        assigneeIds: actorIsMember ? [actorUserId] : [],
+        ...(features.governedWorkflow
+          ? {
+              ...(actorIsMember ? { ownerUserId: actorUserId } : {}),
+              // A gate is due the moment the run reaches it.
+              workingTargetDate: new Date().toISOString().slice(0, 10),
+            }
+          : {}),
+      },
+      features,
+      ...(features.governedWorkflow
+        ? {
+            workObligationSource: {
+              type: WORK_OBLIGATION_SOURCE.FLOW,
+              description: null,
+            },
+          }
+        : {}),
+    }),
+  );
+  return unwrapOrFlowStepError(
+    task,
+    "The review task for this gate could not be created.",
+  ).entityId;
+};
+
+/**
+ * Pause the run at a review gate. The gate raises a task for the run's actor
+ * (the launcher, or the definition's author for an automated run) so the
+ * decision sits in their task list and, under governed workflow, in My Work;
+ * the bell notification stays as the ping. The step keeps the task it raised,
+ * and settling either side settles the other.
+ */
 const pauseAtReviewGate = async ({
-  runId,
+  run,
   stepIndex,
-  workspaceId,
+  stepDef,
   organizationId,
   actorUserId,
-  flowName,
   scopedDb,
   broadcastUpdate,
+  taskFeatures,
 }: {
-  runId: SafeId<"flowRun">;
+  run: LoadedRun;
   stepIndex: number;
-  workspaceId: SafeId<"workspace">;
+  stepDef: Extract<FlowStep, { kind: "review-gate" }>;
   organizationId: SafeId<"organization">;
   actorUserId: SafeId<"user">;
-  flowName: string;
   scopedDb: ReturnType<typeof createRootScopedDb>;
   broadcastUpdate: typeof broadcastFlowRunUpdate;
+  taskFeatures: TaskDeploymentFeatures;
 }): Promise<void> => {
-  const { payload, pings } = await scopedDb(async (tx) => {
+  const runId = run.id;
+  const workspaceId = run.workspaceId;
+  const flowName = run.definitionSnapshot.name;
+  const recordAuditEvent = flowRunAuditRecorder({
+    run,
+    organizationId,
+    actorUserId,
+  });
+  const features = taskFeatures;
+  const { payload, pings, taskEntityId } = await scopedDb(async (tx) => {
+    // A redelivered job must not raise a second task: the step keeps the one
+    // it already raised and only the status writes below are repeated.
+    const stepRows = await tx
+      .select({ reviewTaskEntityId: flowRunSteps.reviewTaskEntityId })
+      .from(flowRunSteps)
+      .where(
+        and(eq(flowRunSteps.runId, runId), eq(flowRunSteps.index, stepIndex)),
+      )
+      .limit(1);
+    const reviewTaskEntityId =
+      stepRows.at(0)?.reviewTaskEntityId ??
+      (await raiseReviewTask({
+        tx,
+        run,
+        stepDef,
+        actorUserId,
+        features,
+        recordAuditEvent,
+      }));
     await tx
       .update(flowRunSteps)
-      .set({ status: "awaiting_review" })
+      .set({ status: "awaiting_review", reviewTaskEntityId })
       .where(
         and(eq(flowRunSteps.runId, runId), eq(flowRunSteps.index, stepIndex)),
       );
@@ -824,10 +1043,15 @@ const pauseAtReviewGate = async ({
       ],
       tx,
     );
-    return { payload: await readRunProgress(tx, runId), pings: gatePings };
+    return {
+      payload: await readRunProgress(tx, runId),
+      pings: gatePings,
+      taskEntityId: reviewTaskEntityId,
+    };
   });
   broadcastUpdate(workspaceId, payload);
   pingNotificationRecipients(pings);
+  flushEntitySearchRepairs([taskEntityId]).catch(captureError);
 };
 
 const readRunProgress = async (
@@ -961,6 +1185,8 @@ export type ResolveFlowReviewGateOptions = {
   userId: SafeId<"user">;
   decision: FlowReviewDecision;
   note: string | null;
+  /** Records the review task's settlement as the reviewer's own act. */
+  recordAuditEvent: AuditRecorder;
 };
 
 /**
@@ -977,6 +1203,7 @@ export const resolveFlowReviewGate = async (
     userId,
     decision,
     note,
+    recordAuditEvent,
   }: ResolveFlowReviewGateOptions,
   {
     broadcastUpdate = broadcastFlowRunUpdate,
@@ -1028,7 +1255,7 @@ export const resolveFlowReviewGate = async (
       safeDb((tx) =>
         tx.query.flowRunSteps.findFirst({
           where: { runId: { eq: runId }, index: { eq: stepIndex } },
-          columns: { kind: true, status: true },
+          columns: { kind: true, status: true, reviewTaskEntityId: true },
         }),
       ),
     );
@@ -1070,6 +1297,20 @@ export const resolveFlowReviewGate = async (
             ),
           );
 
+        if (step.reviewTaskEntityId !== null) {
+          // Either decision fulfils the task the gate raised; the decision
+          // itself lives on the step.
+          await settleReviewTask({
+            tx,
+            taskEntityId: step.reviewTaskEntityId,
+            workspaceId,
+            actorUserId: userId,
+            action: "complete",
+            reason: note,
+            recordAuditEvent,
+          });
+        }
+
         const nextStatus = reviewGateNextStatus(resolution.kind);
 
         await tx
@@ -1102,6 +1343,13 @@ export const resolveFlowReviewGate = async (
               ),
             );
         }
+
+        await recordAuditEvent(tx, {
+          action: AUDIT_ACTION.REVIEW,
+          resourceType: AUDIT_RESOURCE_TYPE.FLOW_RUN,
+          resourceId: runId,
+          changes: { review: { old: null, new: { decision } } },
+        });
 
         return {
           nextStatus,
@@ -1168,6 +1416,9 @@ export type CancelFlowRunOptions = {
   safeDb: SafeDb;
   workspaceId: SafeId<"workspace">;
   runId: SafeId<"flowRun">;
+  userId: SafeId<"user">;
+  /** Records the cancellation of an open review task as the caller's act. */
+  recordAuditEvent: AuditRecorder;
 };
 
 /**
@@ -1178,6 +1429,8 @@ export const cancelFlowRun = async ({
   safeDb,
   workspaceId,
   runId,
+  userId,
+  recordAuditEvent,
 }: CancelFlowRunOptions): Promise<
   Result<FlowRunActionResult, HandlerError | SafeDbError>
 > =>
@@ -1211,8 +1464,9 @@ export const cancelFlowRun = async ({
           .update(flowRuns)
           .set({ status: "cancelled", finishedAt: now })
           .where(eq(flowRuns.id, runId));
-        // Any not-yet-terminal step is abandoned.
-        await tx
+        // Any not-yet-terminal step is abandoned, and the task an open gate
+        // raised is withdrawn with it.
+        const abandoned = await tx
           .update(flowRunSteps)
           .set({ status: "skipped", finishedAt: now })
           .where(
@@ -1224,7 +1478,22 @@ export const cancelFlowRun = async ({
                 "awaiting_review",
               ]),
             ),
-          );
+          )
+          .returning({ reviewTaskEntityId: flowRunSteps.reviewTaskEntityId });
+        for (const step of abandoned) {
+          if (step.reviewTaskEntityId === null) {
+            continue;
+          }
+          await settleReviewTask({
+            tx,
+            taskEntityId: step.reviewTaskEntityId,
+            workspaceId,
+            actorUserId: userId,
+            action: "cancel",
+            reason: null,
+            recordAuditEvent,
+          });
+        }
         return await readRunProgress(tx, runId);
       }),
     );

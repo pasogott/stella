@@ -36,6 +36,9 @@ import {
   flowRunSteps,
   notifications,
   properties,
+  WORK_OBLIGATION_SOURCE,
+  WORK_OBLIGATION_STATUS,
+  workspaceMembers,
   workspaces,
 } from "@/api/db/schema";
 import { createSafeDb, createScopedDb } from "@/api/db/scoped";
@@ -50,8 +53,10 @@ import {
   resolveFlowReviewGate as resolveFlowReviewGateWithDependencies,
 } from "@/api/lib/flows/flow-executor";
 import type { FlowStep, FlowTrigger } from "@/api/lib/flows/flow-types";
+import { decideGateForTask } from "@/api/lib/flows/review-gate-task";
 import { startFlowRun } from "@/api/lib/flows/start-flow-run";
 import type { generateTanStackTextForRole } from "@/api/lib/tanstack-ai-generate";
+import { updateTaskHandler } from "@/api/lib/tasks/update-task";
 import { DOCX_MIME_TYPE } from "@/api/mime-types";
 import { mintAuthProviderId } from "@/api/tests/helpers/auth-provider-id";
 import { startFakeS3 } from "@/api/tests/helpers/fake-s3";
@@ -139,7 +144,33 @@ const executeFlowStepWithTestModel = async (
     broadcastUpdate,
     createEntity,
     loadAIConfig: async () => null,
+    // Governed workflow on: the gate's task must carry an obligation.
+    taskFeatures: { governedWorkflow: true, legalLists: false },
   });
+
+/** The task a run's review gate raised, with the obligation that governs it. */
+const loadReviewTask = async (runId: SafeId<"flowRun">, stepIndex: number) => {
+  const step = await testDb.query.flowRunSteps.findFirst({
+    where: { runId: { eq: runId }, index: { eq: stepIndex } },
+    columns: { reviewTaskEntityId: true },
+  });
+  const taskEntityId = step?.reviewTaskEntityId ?? null;
+  if (taskEntityId === null) {
+    throw new Error("expected the review gate to have raised a task");
+  }
+  const task = await testDb.query.entities.findFirst({
+    where: { id: { eq: taskEntityId } },
+    columns: { kind: true, name: true, status: true, workspaceId: true },
+  });
+  const obligation = await testDb.query.workObligations.findFirst({
+    where: { entityId: { eq: taskEntityId } },
+    columns: { status: true, ownerUserId: true, sourceType: true },
+  });
+  if (!task || !obligation) {
+    throw new Error("expected the review task and its obligation to exist");
+  }
+  return { taskEntityId, task, obligation };
+};
 
 type ResolveReviewGateDependencies = NonNullable<
   Parameters<typeof resolveFlowReviewGateWithDependencies>[1]
@@ -206,6 +237,11 @@ describe("flow run worker pipeline (ai -> review-gate -> create-document)", () =
       organizationId,
       name: "Flow worker test matter",
       reference: workspaceId.slice(0, 8),
+    });
+    await testDb.insert(workspaceMembers).values({
+      id: createSafeId<"workspaceMember">(),
+      workspaceId,
+      userId,
     });
     await testDb.insert(properties).values({
       id: propertyId,
@@ -276,6 +312,22 @@ describe("flow run worker pipeline (ai -> review-gate -> create-document)", () =
     // A review gate pauses for a human; the executor does not self-enqueue.
     expect(enqueuedSteps).toHaveLength(0);
 
+    // The gate raised a task for the run's actor, owned and already
+    // acknowledged by them, sourced from the flow so its completion routes
+    // back to the gate.
+    const raised = await loadReviewTask(runId, 1);
+    expect(raised.task).toEqual({
+      kind: "task",
+      name: "Contract memo flow · Legal review",
+      status: "open",
+      workspaceId,
+    });
+    expect(raised.obligation).toEqual({
+      status: WORK_OBLIGATION_STATUS.ACTIVE,
+      ownerUserId: userId,
+      sourceType: WORK_OBLIGATION_SOURCE.FLOW,
+    });
+
     const reviewed = await resolveFlowReviewGate({
       safeDb,
       workspaceId,
@@ -284,11 +336,17 @@ describe("flow run worker pipeline (ai -> review-gate -> create-document)", () =
       userId,
       decision: "approved",
       note: null,
+      recordAuditEvent: async () => undefined,
     });
     if (Result.isError(reviewed)) {
       throw reviewed.error;
     }
     expect(reviewed.value.status).toBe("running");
+
+    // Deciding the gate fulfils the task it raised.
+    const settled = await loadReviewTask(runId, 1);
+    expect(settled.task.status).toBe("done");
+    expect(settled.obligation.status).toBe(WORK_OBLIGATION_STATUS.COMPLETED);
 
     // Approving advances to `create-document`.
     expect(enqueuedSteps.pop()).toEqual({ runId, stepIndex: 2 });
@@ -400,6 +458,78 @@ describe("flow run worker pipeline (ai -> review-gate -> create-document)", () =
     ).toContain('w:styleId="BodyText"');
   });
 
+  test("closing the gate's task through a task status change approves the gate", async () => {
+    const definitionId = createSafeId<"flowDefinition">();
+    await testDb.insert(flowDefinitions).values({
+      id: definitionId,
+      organizationId,
+      name: "Task-decided flow",
+      steps: [AI_STEP, REVIEW_GATE_STEP, CREATE_DOCUMENT_STEP],
+      trigger: MANUAL_TRIGGER,
+      enabled: true,
+      createdByUserId: userId,
+    });
+    const safeDb = asTestRaw<SafeDb>(
+      createSafeDb(testDb, [workspaceId], organizationId, userId),
+    );
+    const started = await startFlowRun({
+      safeDb,
+      workspaceId,
+      organizationId,
+      definitionId,
+      inputEntityIds: [],
+      triggerSource: { type: "manual", userId },
+      enqueueStep: enqueueFlowStepMock,
+    });
+    if (Result.isError(started)) {
+      throw started.error;
+    }
+    const runId = started.value.runId;
+    expect(enqueuedSteps.pop()).toEqual({ runId, stepIndex: 0 });
+    await executeFlowStepWithTestModel(
+      { runId, stepIndex: 0 },
+      new AbortController().signal,
+    );
+    expect(enqueuedSteps.pop()).toEqual({ runId, stepIndex: 1 });
+    await executeFlowStepWithTestModel(
+      { runId, stepIndex: 1 },
+      new AbortController().signal,
+    );
+    const raised = await loadReviewTask(runId, 1);
+
+    // The task panel, the kanban board, and the save_task capability all
+    // change a task's status this way; for a gate task that is the decision.
+    const updated = await Result.gen(() =>
+      updateTaskHandler({
+        safeDb,
+        workspaceId,
+        userId,
+        recordAuditEvent: async () => undefined,
+        body: { taskId: raised.taskEntityId, status: "done" },
+        features: { governedWorkflow: true, legalLists: false },
+        decideGate: async (options) =>
+          await decideGateForTask(options, {
+            broadcastUpdate,
+            enqueueStep: enqueueFlowStepMock,
+            database: reviewGateDatabase,
+          }),
+      }),
+    );
+    if (Result.isError(updated)) {
+      throw updated.error;
+    }
+
+    const run = await testDb.query.flowRuns.findFirst({
+      where: { id: { eq: runId } },
+      columns: { status: true, currentStepIndex: true },
+    });
+    expect(run).toEqual({ status: "running", currentStepIndex: 2 });
+    expect(enqueuedSteps.pop()).toEqual({ runId, stepIndex: 2 });
+    const settled = await loadReviewTask(runId, 1);
+    expect(settled.task.status).toBe("done");
+    expect(settled.obligation.status).toBe(WORK_OBLIGATION_STATUS.COMPLETED);
+  });
+
   test("rejecting the review gate cancels the run instead of creating a document", async () => {
     const definitionId = createSafeId<"flowDefinition">();
     await testDb.insert(flowDefinitions).values({
@@ -448,11 +578,17 @@ describe("flow run worker pipeline (ai -> review-gate -> create-document)", () =
       userId,
       decision: "rejected",
       note: "Not approved.",
+      recordAuditEvent: async () => undefined,
     });
     if (Result.isError(rejected)) {
       throw rejected.error;
     }
     expect(rejected.value.status).toBe("cancelled");
+
+    // A rejection is a decision too: the review task is done, not abandoned.
+    const settled = await loadReviewTask(runId, 1);
+    expect(settled.task.status).toBe("done");
+    expect(settled.obligation.status).toBe(WORK_OBLIGATION_STATUS.COMPLETED);
 
     const run = await testDb.query.flowRuns.findFirst({
       where: { id: { eq: runId } },
@@ -515,6 +651,7 @@ describe("flow run worker pipeline (ai -> review-gate -> create-document)", () =
       userId,
       decision: "approved",
       note: null,
+      recordAuditEvent: async () => undefined,
     });
     if (Result.isError(approved)) {
       throw approved.error;
