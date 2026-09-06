@@ -30,11 +30,15 @@ import {
   describeError,
   reportDesktopError,
 } from "../telemetry/desktop-telemetry";
-import { clipboardSourceLabel, clipboardSourceTitle } from "./clipboard-logic";
-import { CLIPBOARD_GROUP_ACCENTS } from "./clipboard-style";
+import {
+  clipboardSourceLabel,
+  clipboardSourceTitle,
+  hasClipboardPrimaryModifier,
+} from "./clipboard-logic";
 import { isClipboardEditorContext } from "./clipboard-types";
 import type { ClipboardEditorContext } from "./clipboard-types";
 import { ClipboardImagePreview } from "./ClipboardImagePreview";
+import { ClipboardSourceIcon } from "./ClipboardSourceIcon";
 
 type SaveState =
   | { type: "idle" }
@@ -700,7 +704,13 @@ const ClipboardEditor = () => {
       requestClose();
       return;
     }
-    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    const primaryModifier = hasClipboardPrimaryModifier({
+      altGraphKey: event.getModifierState("AltGraph"),
+      altKey: event.altKey,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+    });
+    if (primaryModifier && event.key === "Enter") {
       event.preventDefault();
       save();
     }
@@ -768,12 +778,10 @@ const ClipboardEditor = () => {
               title={sourceTitle}
             >
               {sourceVisual?.iconDataUrl ? (
-                <img
-                  alt=""
-                  aria-hidden="true"
-                  className="size-4 shrink-0 rounded-[3px]"
-                  draggable={false}
-                  src={sourceVisual.iconDataUrl}
+                <ClipboardSourceIcon
+                  iconDataUrl={sourceVisual.iconDataUrl}
+                  kind={item.sourceApp?.page ? "favicon" : "app"}
+                  size="inline"
                 />
               ) : (
                 <span
@@ -894,7 +902,7 @@ const ClipboardEditor = () => {
                       aria-hidden="true"
                       className="size-2 shrink-0 rounded-full"
                       style={{
-                        backgroundColor: CLIPBOARD_GROUP_ACCENTS[group.color],
+                        backgroundColor: group.color,
                       }}
                     />
                     <span dir="auto">{group.name}</span>

@@ -65,13 +65,10 @@ export type ClipboardItem =
 
 export type ClipboardCaptureStatus = "active" | "paused";
 
-export type ClipboardGroupColor =
-  | "gray"
-  | "blue"
-  | "emerald"
-  | "amber"
-  | "rose"
-  | "violet";
+/** A group accent as lowercase `#rrggbb`, the shape the native side normalises to. */
+export type ClipboardGroupColor = string & {
+  readonly __brand: "ClipboardGroupColor";
+};
 
 export type ClipboardGroup = {
   color: ClipboardGroupColor;
@@ -87,6 +84,15 @@ export type ClipboardPersistence =
 
 export type ClipboardWelcomeStatus = "initializing" | "pending" | "completed";
 
+export const CLIPBOARD_SCREEN_CAPTURES = ["hidden", "visible"] as const;
+
+export type ClipboardScreenCapture = (typeof CLIPBOARD_SCREEN_CAPTURES)[number];
+
+const isClipboardScreenCapture = (
+  value: unknown,
+): value is ClipboardScreenCapture =>
+  CLIPBOARD_SCREEN_CAPTURES.some((capture) => capture === value);
+
 export const CLIPBOARD_RETENTIONS = ["week", "month", "year"] as const;
 
 export type ClipboardRetention = (typeof CLIPBOARD_RETENTIONS)[number];
@@ -100,6 +106,7 @@ export type ClipboardSnapshot = {
   items: ClipboardItem[];
   persistence: ClipboardPersistence;
   retention: ClipboardRetention;
+  screenCapture: ClipboardScreenCapture;
   sourceAppVisuals: ClipboardSourceAppVisual[];
   welcomeStatus: ClipboardWelcomeStatus;
 };
@@ -179,13 +186,10 @@ export const isClipboardItem = (value: unknown): value is ClipboardItem => {
   }
 };
 
-const isClipboardGroupColor = (value: unknown): value is ClipboardGroupColor =>
-  value === "gray" ||
-  value === "blue" ||
-  value === "emerald" ||
-  value === "amber" ||
-  value === "rose" ||
-  value === "violet";
+export const isClipboardGroupColor = (
+  value: unknown,
+): value is ClipboardGroupColor =>
+  typeof value === "string" && /^#[\da-f]{6}$/u.test(value);
 
 export const isClipboardGroup = (value: unknown): value is ClipboardGroup =>
   isRecord(value) &&
@@ -256,6 +260,7 @@ export const isClipboardSnapshot = (
     value["items"].every(isClipboardItem) &&
     isPersistence(value["persistence"]) &&
     isClipboardRetention(value["retention"]) &&
+    isClipboardScreenCapture(value["screenCapture"]) &&
     Array.isArray(value["sourceAppVisuals"]) &&
     value["sourceAppVisuals"].every(isClipboardSourceAppVisual) &&
     (value["welcomeStatus"] === "pending" ||

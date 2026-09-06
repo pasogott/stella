@@ -13,6 +13,7 @@ import {
   clipboardSourceTintIndex,
   filterClipboardItems,
   formatClipboardAge,
+  hasClipboardPrimaryModifier,
   highlightClipboardText,
   isClipboardCopyShortcut,
   isClipboardNameInput,
@@ -346,15 +347,71 @@ describe("keyboard indexes", () => {
     );
   });
 
-  test("quick copy only accepts visible slots one through nine", () => {
-    expect(quickCopyIndex("2", 2)).toBe(1);
-    expect(quickCopyIndex("3", 2)).toBeNull();
-    expect(quickCopyIndex("0", 10)).toBeNull();
+  test("quick copy follows the physical digit key, not the layout's character", () => {
+    expect(quickCopyIndex("Digit2", 2)).toBe(1);
+    expect(quickCopyIndex("Numpad1", 2)).toBe(0);
+    expect(quickCopyIndex("Digit3", 2)).toBeNull();
+    expect(quickCopyIndex("Digit0", 10)).toBeNull();
+    // Czech layout: the key labelled 2 produces "ě" and the key labelled 1 "+".
+    expect(quickCopyIndex("ě", 10)).toBeNull();
+    expect(quickCopyIndex("+", 10)).toBeNull();
+    expect(quickCopyIndex("2", 10)).toBeNull();
+  });
+
+  test("AltGr never counts as the primary modifier", () => {
+    // Windows and Linux report AltGr as Ctrl+Alt; Spanish AltGr+2 types "@".
+    expect(
+      hasClipboardPrimaryModifier({
+        altGraphKey: true,
+        altKey: true,
+        ctrlKey: true,
+        metaKey: false,
+      }),
+    ).toBe(false);
+    expect(
+      hasClipboardPrimaryModifier({
+        altGraphKey: true,
+        altKey: false,
+        ctrlKey: true,
+        metaKey: false,
+      }),
+    ).toBe(false);
+    expect(
+      hasClipboardPrimaryModifier({
+        altGraphKey: false,
+        altKey: false,
+        ctrlKey: true,
+        metaKey: false,
+      }),
+    ).toBe(true);
+    expect(
+      hasClipboardPrimaryModifier({
+        altGraphKey: false,
+        altKey: false,
+        ctrlKey: false,
+        metaKey: true,
+      }),
+    ).toBe(true);
+  });
+
+  test("copy ignores an AltGr character key", () => {
+    // Polish layout: AltGr+C types "ć".
+    expect(
+      isClipboardCopyShortcut({
+        altGraphKey: true,
+        altKey: true,
+        ctrlKey: true,
+        key: "c",
+        metaKey: false,
+        shiftKey: false,
+      }),
+    ).toBe(false);
   });
 
   test("copy accepts either platform primary modifier", () => {
     expect(
       isClipboardCopyShortcut({
+        altGraphKey: false,
         altKey: false,
         ctrlKey: false,
         key: "c",
@@ -364,6 +421,7 @@ describe("keyboard indexes", () => {
     ).toBe(true);
     expect(
       isClipboardCopyShortcut({
+        altGraphKey: false,
         altKey: false,
         ctrlKey: true,
         key: "C",
@@ -376,6 +434,7 @@ describe("keyboard indexes", () => {
   test("copy does not consume modified variants", () => {
     expect(
       isClipboardCopyShortcut({
+        altGraphKey: false,
         altKey: false,
         ctrlKey: false,
         key: "c",
@@ -385,6 +444,7 @@ describe("keyboard indexes", () => {
     ).toBe(false);
     expect(
       isClipboardCopyShortcut({
+        altGraphKey: false,
         altKey: false,
         ctrlKey: true,
         key: "c",
