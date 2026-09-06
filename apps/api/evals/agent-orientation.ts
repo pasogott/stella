@@ -5,7 +5,7 @@ import type { StandardJSONSchemaV1 } from "@standard-schema/spec";
  * without executing anything?
  *
  * Each task is one user request that carries concrete ids in its context
- * (a workspace, a template, a matter, a contact, a document). Two surfaces
+ * (a matter, a template, a contact, a document). Two surfaces
  * are checked:
  *
  *   mcp   The model sees the exact wire tools a real MCP client gets
@@ -416,17 +416,17 @@ type Task = {
 
 const TASKS: readonly Task[] = [
   {
-    id: "list-workspace-documents",
+    id: "list-matter-documents",
     request:
-      "List every document and folder in workspace ws_acme_2024, the top level.",
+      "List every document and folder in matter ws_acme_2024, the top level.",
     mcp: {
       toolName: "list_documents",
-      checkArgs: (args) => field(args, "workspace_id", "ws_acme_2024"),
+      checkArgs: (args) => field(args, "matter_id", "ws_acme_2024"),
     },
     cli: {
       kind: "command",
       path: ["document", "list"],
-      flags: { "workspace-id": "ws_acme_2024" },
+      flags: { "matter-id": "ws_acme_2024" },
     },
   },
   {
@@ -467,11 +467,11 @@ const TASKS: readonly Task[] = [
   },
   {
     id: "run-playbook",
-    request: "Run playbook pb_diligence_v2 over workspace ws_diligence_17.",
+    request: "Run playbook pb_diligence_v2 over matter ws_diligence_17.",
     mcp: {
       toolName: "run_playbook",
       checkArgs: (args) => [
-        ...field(args, "workspace_id", "ws_diligence_17"),
+        ...field(args, "matter_id", "ws_diligence_17"),
         ...field(args, "playbook_id", "pb_diligence_v2"),
       ],
     },
@@ -479,7 +479,7 @@ const TASKS: readonly Task[] = [
       kind: "command",
       path: ["playbook", "run"],
       flags: {
-        "workspace-id": "ws_diligence_17",
+        "matter-id": "ws_diligence_17",
         "playbook-id": "pb_diligence_v2",
       },
     },
@@ -505,16 +505,12 @@ const TASKS: readonly Task[] = [
     request:
       "Start a DeepL translation to German of document " +
       "ent_7f7f7f7f-1111-2222-3333-444444444444, file field " +
-      "fld_5e5e5e5e-1111-2222-3333-444444444444, in workspace ws_acme_2024.",
+      "fld_5e5e5e5e-1111-2222-3333-444444444444, in matter ws_acme_2024.",
     mcp: {
       toolName: "invoke_capability",
       checkArgs: (args) => [
         ...field(args, "capability", "document-translations.runs.create"),
-        ...nestedField(
-          args,
-          ["input", "params", "workspaceId"],
-          "ws_acme_2024",
-        ),
+        ...nestedField(args, ["input", "params", "matterId"], "ws_acme_2024"),
         ...nestedField(
           args,
           ["input", "body", "entityId"],
@@ -537,7 +533,7 @@ const TASKS: readonly Task[] = [
       // each expected value from that payload, so a reply that names the
       // command but omits the body fails here as it would at the CLI.
       flags: {
-        workspace: "ws_acme_2024",
+        "matter-id": "ws_acme_2024",
         "entity-id": "7f7f7f7f-1111-2222-3333-444444444444",
         "field-id": "5e5e5e5e-1111-2222-3333-444444444444",
         "target-lang": "de",
@@ -548,22 +544,18 @@ const TASKS: readonly Task[] = [
   },
   {
     id: "start-workflow-extraction",
-    request: "Start the extraction workflow in workspace ws_acme_2024.",
+    request: "Start the extraction workflow in matter ws_acme_2024.",
     mcp: {
       toolName: "invoke_capability",
       checkArgs: (args) => [
-        ...field(args, "capability", "workspaces.workflow-start"),
-        ...nestedField(
-          args,
-          ["input", "params", "workspaceId"],
-          "ws_acme_2024",
-        ),
+        ...field(args, "capability", "matters.workflow-start"),
+        ...nestedField(args, ["input", "params", "matterId"], "ws_acme_2024"),
       ],
     },
     cli: {
       kind: "command",
-      path: ["capability", "workspaces", "workflow-start"],
-      flags: { workspace: "ws_acme_2024" },
+      path: ["capability", "matters", "workflow-start"],
+      flags: { "matter-id": "ws_acme_2024" },
     },
   },
   {
@@ -609,7 +601,7 @@ const TASKS: readonly Task[] = [
       path: ["upload"],
       flags: {
         file: "./contract-v2.docx",
-        "workspace-id": "ws_acme_2024",
+        "matter-id": "ws_acme_2024",
         "entity-id": "doc_42",
       },
     },
@@ -949,9 +941,9 @@ const kebabToCamel = (flagName: string): string =>
 // A CLI flag whose value the eval also accepts from the `--input` JSON escape
 // hatch under a schema key that differs from the flag's own kebab-cased name
 // (`document field set`'s `translate`d body sits under a nested capability
-// wrapper; `--workspace` maps to the schema's `workspaceId`, not `workspace`).
+// wrapper; `--matter-id` maps to the schema's `matterId`, not `matter_id`).
 const FLAG_INPUT_KEY_ALIASES: Readonly<Record<string, readonly string[]>> = {
-  workspace: ["workspaceId", "workspace_id"],
+  "matter-id": ["matterId", "matter_id"],
 };
 
 /** One level of `--input`'s body/params/query/values wrapper flattened to top. */

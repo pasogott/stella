@@ -246,7 +246,7 @@ describe("static tools reject explicit null on plain optional fields", () => {
     { tool: "save_matter", args: { name: null }, path: "name" },
     {
       tool: "list_documents",
-      args: { workspace_id: "ws_1", mode: null },
+      args: { matter_id: "ws_1", mode: null },
       path: "mode",
     },
   ];
@@ -297,7 +297,7 @@ describe("invoke_capability rejects explicit null on plain optional fields", () 
     {
       label: "time-entries.export-csv query.status",
       capability: "time-entries.export-csv",
-      input: { params: { workspaceId: "ws_1" }, query: { status: null } },
+      input: { params: { matterId: "ws_1" }, query: { status: null } },
       pathPrefix: "query.status",
     },
     {
@@ -310,7 +310,7 @@ describe("invoke_capability rejects explicit null on plain optional fields", () 
       label: "tasks.calendar body.datePropertyIds",
       capability: "tasks.calendar",
       input: {
-        params: { workspaceId: "ws_1" },
+        params: { matterId: "ws_1" },
         body: {
           dateFrom: "2026-01-01T00:00:00.000Z",
           dateTo: "2026-01-31T00:00:00.000Z",
@@ -346,7 +346,7 @@ describe("invoke_capability accepts explicit null on nullable fields", () => {
       label: "case-law.matter-links.create body.note",
       capability: "case-law.matter-links.create",
       input: {
-        params: { workspaceId: "ws_1" },
+        params: { matterId: "ws_1" },
         body: {
           decisionId: "00000000-0000-0000-0000-000000000000",
           note: null,
@@ -358,7 +358,7 @@ describe("invoke_capability accepts explicit null on nullable fields", () => {
       capability: "contacts.update",
       input: {
         params: {
-          workspaceId: "ws_1",
+          matterId: "ws_1",
           contactId: "00000000-0000-0000-0000-000000000000",
         },
         body: { firstName: null },
