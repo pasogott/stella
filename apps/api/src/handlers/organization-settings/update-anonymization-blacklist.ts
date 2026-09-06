@@ -1,14 +1,13 @@
 import { Result } from "better-result";
-import { and, eq, inArray, isNull } from "drizzle-orm";
 import { t } from "elysia";
 
-import { anonymizationBlacklistEntries } from "@/api/db/schema";
-import { normalizeAnonymizationBlacklistEntries } from "@/api/lib/anonymization-blacklist";
-import { loadOrganizationAnonymizationTermsForWrite } from "@/api/lib/anonymization-write-cap";
+import {
+  normalizeAnonymizationBlacklistEntries,
+  replaceOrganizationAnonymizationBlacklist,
+} from "@/api/lib/anonymization-blacklist";
 import { createSafeRootHandler } from "@/api/lib/api-handlers";
 import type { HandlerConfig } from "@/api/lib/api-handlers";
 import { AUDIT_ACTION, AUDIT_RESOURCE_TYPE } from "@/api/lib/audit-log";
-import { createSafeId } from "@/api/lib/branded-types";
 import { LIMITS } from "@/api/lib/limits";
 
 const blacklistEntrySchema = t.Object({
@@ -48,99 +47,19 @@ const updateAnonymizationBlacklist = createSafeRootHandler(
       return Result.err(entries.error);
     }
 
-    // Restrict every read/write below to org-wide rows
-    // (workspace_id IS NULL). Workspace-scoped terms created from
-    // the inspector live in the same table and must not be visible
-    // to — or deletable by — the firm-wide settings page.
     yield* Result.await(
       safeDb(async (tx) => {
-        // Locks the org-wide set for the rest of this transaction. The
-        // replace deletes only the rows its own read saw, so two
-        // concurrent replacements would otherwise each keep their own
-        // set and leave the union of both behind: twice the cap.
-        const existingRows = await loadOrganizationAnonymizationTermsForWrite(
-          tx,
-          session.activeOrganizationId,
-        );
-
-        const existingByCanonical = new Map(
-          existingRows.map((row) => [row.canonical.toLocaleLowerCase(), row]),
-        );
-        const incomingCanonicalKeys = new Set(
-          entries.value.map((entry) => entry.canonical.toLocaleLowerCase()),
-        );
-
-        const idsToDelete: (typeof existingRows)[number]["id"][] = [];
-        for (const row of existingRows) {
-          if (!incomingCanonicalKeys.has(row.canonical.toLocaleLowerCase())) {
-            idsToDelete.push(row.id);
-          }
-        }
-
-        if (idsToDelete.length > 0) {
-          await tx
-            .delete(anonymizationBlacklistEntries)
-            .where(
-              and(
-                eq(
-                  anonymizationBlacklistEntries.organizationId,
-                  session.activeOrganizationId,
-                ),
-                isNull(anonymizationBlacklistEntries.workspaceId),
-                inArray(anonymizationBlacklistEntries.id, idsToDelete),
-              ),
-            );
-        }
-
-        if (entries.value.length === 0) {
-          return;
-        }
-
-        const now = new Date();
-
-        for (const entry of entries.value) {
-          const existing = existingByCanonical.get(
-            entry.canonical.toLocaleLowerCase(),
-          );
-
-          if (existing) {
-            // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- sequential by design: sequential blacklist upserts inside one transaction
-            await tx
-              .update(anonymizationBlacklistEntries)
-              .set({
-                label: entry.label,
-                canonical: entry.canonical,
-                variants: entry.variants,
-                enabled: entry.enabled,
-                updatedBy: user.id,
-                updatedAt: now,
-              })
-              .where(
-                and(
-                  eq(anonymizationBlacklistEntries.id, existing.id),
-                  eq(
-                    anonymizationBlacklistEntries.organizationId,
-                    session.activeOrganizationId,
-                  ),
-                  isNull(anonymizationBlacklistEntries.workspaceId),
-                ),
-              );
-            continue;
-          }
-
-          // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- sequential blacklist upserts inside one transaction
-          await tx.insert(anonymizationBlacklistEntries).values({
-            id: createSafeId<"anonymizationBlacklistEntry">(),
+        const { deletedCount } =
+          await replaceOrganizationAnonymizationBlacklist({
+            entries: entries.value,
             organizationId: session.activeOrganizationId,
-            label: entry.label,
-            canonical: entry.canonical,
-            variants: entry.variants,
-            enabled: entry.enabled,
-            createdBy: user.id,
-            updatedBy: user.id,
+            tx,
+            userId: user.id,
           });
-        }
 
+        // Outside the write above, and unconditional: clearing the list is
+        // the most destructive shape this endpoint has, and it used to
+        // return before reaching the audit row.
         await recordAuditEvent(tx, {
           action: AUDIT_ACTION.UPDATE,
           resourceType: AUDIT_RESOURCE_TYPE.ORGANIZATION_SETTINGS,
@@ -148,7 +67,7 @@ const updateAnonymizationBlacklist = createSafeRootHandler(
           metadata: {
             field: "anonymizationBlacklist",
             entryCount: entries.value.length,
-            deletedCount: idsToDelete.length,
+            deletedCount,
           },
         });
       }),
