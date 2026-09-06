@@ -27,6 +27,10 @@ import {
   W_NS,
 } from "./ooxml";
 import {
+  authoredParagraphIndices,
+  normalizeRowBlockMarkers,
+} from "./row-block-markers";
+import {
   boundTemplateWarnings,
   collectParagraphWarnings,
   type TemplateWarning,
@@ -432,9 +436,19 @@ const collectContainerStructure = ({
   warnings,
 }: ContainerStructureOptions) => {
   const paragraphs = body.getElementsByTagNameNS(W_NS, "p");
+  // Positions to report. Everything below indexes `paragraphs`, which carries
+  // the marker paragraphs normalization hoisted out of a table row's cells;
+  // a diagnostic has to name the paragraph the author can count to instead.
+  const authoredIndices = authoredParagraphIndices(paragraphs);
   const directives = scanBlockDirectives(body);
   const { blocks, errors: parseErrors } = parseBlockTree(directives);
-  errors.push(...parseErrors);
+  for (const error of parseErrors) {
+    errors.push({
+      ...error,
+      paragraphIndex:
+        authoredIndices[error.paragraphIndex] ?? error.paragraphIndex,
+    });
+  }
   const arrayScopes = new Map<number, readonly RowScope[]>();
   const activeArrays: RowScope[] = [];
   const directiveByParagraph = new Map(
@@ -471,7 +485,7 @@ const collectContainerStructure = ({
       warnings.push(
         ...collectParagraphWarnings({
           loops: activeArrays,
-          paragraphIndex: i,
+          paragraphIndex: authoredIndices[i] ?? i,
           text: paragraphText(paragraph),
         }),
       );
@@ -484,6 +498,7 @@ const collectContainerStructure = ({
 
   return {
     arrayScopes,
+    authoredIndices,
     blocks,
     conditionMap: buildConditionMapFromRanges(directives, paragraphs.length),
     directiveIndices,
@@ -537,6 +552,7 @@ const collectLoopItemFields = ({
 
 const collectParagraphPlaceholders = ({
   arrayScopes,
+  authoredIndices,
   conditionMap,
   conditionPaths,
   directiveIndices,
@@ -573,7 +589,7 @@ const collectParagraphPlaceholders = ({
     if (!inline.ok) {
       errors.push({
         message: inline.message,
-        paragraphIndex: i,
+        paragraphIndex: authoredIndices[i] ?? i,
         directive: inline.directive,
       });
     } else {
@@ -701,6 +717,10 @@ const collectParagraphPlaceholders = ({
  * extract field information from its paragraphs.
  */
 const analyzeContainer = (body: slimdom.Element): AnalysisResult => {
+  // Same rewrite the fill pipeline applies, so a row-form loop is discovered
+  // with its item paths and warns exactly as the own-paragraph form does.
+  normalizeRowBlockMarkers(body);
+
   const fields: FieldAccumulator = new Map();
   const placeholderCounts = new Map<string, number>();
   const errors: TemplateStructureError[] = [];
@@ -832,6 +852,9 @@ const analyzeHeadersAndFooters = async (
 
     const source = hdr ? "header" : "footer";
     const offset = source === "header" ? headerParaCount : footerParaCount;
+    // Count before analysis: normalizing a row-form marker adds a paragraph of
+    // its own, and the running offset must keep counting the authored file.
+    const paraCount = container.getElementsByTagNameNS(W_NS, "p").length;
     const analysis = analyzeContainer(container);
 
     // Tag errors with their source and offset indices to
@@ -841,7 +864,6 @@ const analyzeHeadersAndFooters = async (
       err.paragraphIndex += offset;
     }
 
-    const paraCount = container.getElementsByTagNameNS(W_NS, "p").length;
     if (source === "header") {
       headerParaCount += paraCount;
     } else {
