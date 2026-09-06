@@ -38,6 +38,7 @@ import { PortugueseStemmer } from "@/api/lib/legal-search/morphology/snowball/po
 import { RomanianStemmer } from "@/api/lib/legal-search/morphology/snowball/romanian.gen";
 import { SpanishStemmer } from "@/api/lib/legal-search/morphology/snowball/spanish.gen";
 import { SwedishStemmer } from "@/api/lib/legal-search/morphology/snowball/swedish.gen";
+import { createBoundedMemo } from "@/api/lib/legal-search/morphology/stem-memo";
 
 /** ISO 639-1 codes this module can stem. */
 export const MORPHOLOGY_LANGUAGES = [
@@ -119,6 +120,60 @@ const STEMMERS = {
 >;
 
 /**
+ * Distinct terms the memo keeps before rotating a generation.
+ *
+ * Sized against one indexing batch rather than the corpus: a batch of a few
+ * hundred documents carries a few hundred thousand tokens over tens of
+ * thousands of distinct terms, so a ceiling in this range answers nearly
+ * every repeat inside a batch. A larger ceiling would buy hits only across
+ * batches, where the term distribution has already moved. Retained entries
+ * are at most twice this across both generations, each bounded in size by
+ * {@link STEM_MEMO_MAX_KEY_LENGTH}; the two ceilings together are what put a
+ * number on the memory.
+ */
+const STEM_MEMO_MAX_ENTRIES = 50_000;
+
+/**
+ * Longest memo key: 64 characters of term, plus the two-character language
+ * prefix.
+ *
+ * Tokenisation splits on anything that is not a letter or a digit but caps no
+ * length, and a corpus payload may be tens of millions of characters, so a
+ * single malformed document can hand this module a token of arbitrary size.
+ * Counting entries would then bound the memo's population but not its bytes,
+ * and one such token would stay resident until tens of thousands of ordinary
+ * terms displaced it. Past the ceiling a term is still stemmed, just not
+ * remembered — it is a term that occurs once, which is precisely the case a
+ * memo cannot pay for.
+ *
+ * 64 clears every word any of these algorithms is written for, German and
+ * Finnish compounds included, by a wide margin. A stem never grows past its
+ * term (see stem.property.test.ts), so bounding the key bounds the value too.
+ */
+const STEM_MEMO_MAX_KEY_LENGTH = 66;
+
+/**
+ * Stems already computed, across every language.
+ *
+ * Stemming is the dominant cost of projecting a document into the index, and
+ * a legal corpus repeats its terms: inside one decision, and far more across
+ * the decisions of one batch. A stem is a pure function of the term and the
+ * language, so a remembered answer is the algorithm's answer — the
+ * projection's output is unchanged, only the work is.
+ *
+ * One shared structure rather than one per language, so the memory ceiling is
+ * a single number instead of one multiplied by however many languages a
+ * deployment touches. Keys are the language code followed by the term; every
+ * ISO 639-1 code is two characters, so the prefix is fixed width and no term
+ * can spell its way into another language's entry (`stem.test.ts` holds the
+ * language list to that width).
+ */
+const stemMemo = createBoundedMemo({
+  maxEntries: STEM_MEMO_MAX_ENTRIES,
+  maxKeyLength: STEM_MEMO_MAX_KEY_LENGTH,
+});
+
+/**
  * Reduce a term to its stem for the given language.
  *
  * Two normalisations happen here, and both are preconditions the underlying
@@ -142,8 +197,13 @@ const STEMMERS = {
 export const stemLegalTerm = (
   term: string,
   language: MorphologyLanguage,
-): string => {
-  const normalized = term.normalize("NFC").toLowerCase();
-  const stem = STEMMERS[language].stem(normalized);
-  return stem === "" ? normalized : stem;
-};
+): string =>
+  // Keyed by the term as it arrived, not by its normalised form: the memo
+  // then answers a repeat without normalising it again, and a key that is
+  // already a live string keeps the hash the engine cached for it rather than
+  // rehashing a freshly built one on every lookup.
+  stemMemo.get(`${language}${term}`, () => {
+    const normalized = term.normalize("NFC").toLowerCase();
+    const stem = STEMMERS[language].stem(normalized);
+    return stem === "" ? normalized : stem;
+  });
