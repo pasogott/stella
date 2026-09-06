@@ -2,10 +2,11 @@
 //
 // Each `oxlint-disable-next-line` below intentionally suppresses a case the
 // rule MUST flag (a DB call awaited inside a loop body through native `await`
-// or `yield* Result.await(...)`, or a fan-out via
-// `Promise.all(items.map(...))` / `Promise.allSettled(items.map(...))`,
-// inline or via a named callback resolved to its local definition, awaited
-// or not). If the rule regresses, the matching disable goes unused and
+// or `yield* Result.await(...)`, a helper awaited in a loop with a database
+// handle in its arguments, or a fan-out via `Promise.all(items.map(...))` /
+// `Promise.allSettled(items.map(...))`, inline or via a named callback
+// resolved to its local definition, awaited or not). If the rule regresses,
+// the matching disable goes unused and
 // `--report-unused-disable-directives-severity=error` fails CI. The cases
 // WITHOUT a `no-db-await-in-loop` disable must NOT be flagged by it; a false
 // positive there fails the same run.
@@ -29,8 +30,27 @@ declare const Result: {
     source: (() => Promise<T>) | { try: () => Promise<T>; catch: unknown },
   ) => Promise<T>;
 };
+declare const rootDb: {
+  query: { items: { findFirst: (args: unknown) => Promise<unknown> } };
+};
+declare const ctx: { tx: typeof tx };
 declare const tables: Record<string, unknown>;
 declare const items: { id: string }[];
+declare const groups: { items: { id: string }[] }[];
+declare const itemPages: AsyncIterable<{ id: string }>;
+// Per-row helpers: the query lives behind the call, so only the handle in the
+// argument list marks them as database work.
+declare function upsertRow(
+  handle: unknown,
+  item: { id: string },
+): Promise<void>;
+declare function persistRow(args: {
+  db?: unknown;
+  tx?: unknown;
+  id: string;
+}): Promise<void>;
+declare function computeRow(item: { id: string }): Promise<string>;
+declare function enqueue(task: () => Promise<void>): Promise<void>;
 declare const itemsTable: unknown;
 declare const idColumn: unknown;
 declare const inArray: (col: unknown, values: unknown[]) => unknown;
@@ -128,6 +148,111 @@ export const resultAwaitPromiseAllMapFanOut = async function* () {
           }),
       ),
     ),
+  );
+};
+
+// A helper hides the query, but the handle is right there in the argument
+// list: one round-trip per row all the same.
+export const forOfLoopHelperPositionalHandle = async () => {
+  for (const item of items) {
+    // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: per-row helper call to exercise positional handle detection
+    await upsertRow(tx, item);
+  }
+};
+
+// The handle arrives as an object-literal property value under a handle key.
+export const forOfLoopHelperObjectProperty = async () => {
+  for (const item of items) {
+    // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: per-row helper call to exercise object-property handle detection
+    await persistRow({ db: rootDb, id: item.id });
+  }
+};
+
+// Shorthand is the same property, spelled once.
+export const whileLoopHelperShorthandHandle = async () => {
+  let index = 0;
+  while (index < items.length) {
+    const id = items[index]?.id ?? "";
+    // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: per-row helper call to exercise shorthand handle detection
+    await persistRow({ tx, id });
+    index += 1;
+  }
+};
+
+// The handle reached through the request context is still the handle.
+export const forOfLoopHelperMemberHandle = async () => {
+  for (const item of items) {
+    // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: per-row helper call to exercise member-access handle detection
+    await upsertRow(ctx.tx, item);
+  }
+};
+
+// The inner loop is the one that scales; the outer one multiplies it.
+export const nestedLoopHelperHandle = async () => {
+  for (const group of groups) {
+    for (const item of group.items) {
+      // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: nested loop over a per-row helper call
+      await upsertRow(tx, item);
+    }
+  }
+};
+
+// `for await` iterates a stream, and its body re-runs per item like any other.
+export const forAwaitLoopHelperHandle = async () => {
+  for await (const item of itemPages) {
+    // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: for-await body running a per-row helper call
+    await upsertRow(tx, item);
+  }
+};
+
+// A `yield* Result.await(...)` of a per-row helper is the same call in safe
+// handler dress.
+export const forOfLoopResultAwaitHelperHandle = async function* () {
+  for (const item of items) {
+    // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: delegated Result.await of a per-row helper call
+    yield* Result.await(upsertRow(tx, item));
+  }
+};
+
+// A fan-out whose callback awaits a same-file helper holding the handle is
+// reported once, on the `Promise.all(...)` the fan-out check owns. The inner
+// `await persistRow(...)` carries no directive: a second report there would
+// fail this fixture as an unsuppressed error.
+export const promiseAllMapHelperHandleReportedOnce = async () => {
+  const storeRow = async (item: { id: string }): Promise<void> => {
+    await tx.insert(itemsTable).values(item);
+  };
+  // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: the fan-out check owns this report; the handle shape must not add a second
+  await Promise.all(
+    items.map(async (item) => {
+      await storeRow(item);
+      await persistRow({ tx, id: item.id });
+    }),
+  );
+};
+
+// The callback returns a per-row helper carrying the handle and never awaits
+// it, so no inner `AwaitExpression` exists for the walk-up path to find: the
+// fan-out scan is the only thing that can see this shape.
+export const promiseAllMapHelperHandleAwaitless = async () => {
+  // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop, typescript/promise-function-async -- fixture: awaitless per-row helper carrying the handle; `async` would only trip require-await
+  await Promise.all(items.map((item) => upsertRow(tx, item)));
+};
+
+// The same fan-out nested in a loop: still one report, on the fan-out.
+export const loopedPromiseAllMapHelperHandle = async () => {
+  for (const group of groups) {
+    // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop, typescript/promise-function-async -- fixture: per-loop fan-out over a per-row helper carrying the handle
+    await Promise.all(group.items.map((item) => upsertRow(tx, item)));
+  }
+};
+
+// `Promise.allSettled` fans out the helper shape exactly like `Promise.all`.
+export const promiseAllSettledMapHelperHandle = async () => {
+  // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- fixture: awaitless per-row helper carrying the handle under allSettled
+  await Promise.allSettled(
+    // oxlint-disable-next-line typescript/promise-function-async -- fixture: `async` would only trip require-await
+    items.map((item) => persistRow({ tx, id: item.id })),
   );
 };
 
@@ -253,4 +378,49 @@ export const promiseAllSettledMapNoDbCall = async () => {
       return item.id;
     }),
   );
+};
+
+// The same helper awaited once, outside any loop: one round-trip.
+export const helperHandleOutsideLoop = async () => {
+  await upsertRow(tx, { id: items[0]?.id ?? "" });
+};
+
+// The handle sits inside an arrow passed as a callback, so the awaited call
+// enqueues work rather than running a query per iteration. The inner await is
+// behind a function boundary the rule stops at, and the outer `enqueue(...)`
+// receives a function, not a handle.
+export const loopEnqueuesHandleCallback = async () => {
+  for (const item of items) {
+    await enqueue(async () => {
+      await upsertRow(tx, item);
+    });
+  }
+};
+
+// A helper awaited per iteration that takes no handle at all is in-memory
+// work as far as this rule can tell.
+export const loopHelperWithoutHandle = async () => {
+  for (const item of items) {
+    await computeRow(item);
+  }
+};
+
+// A fan-out whose callback calls a helper with no database handle is an
+// ordinary parallel transform.
+export const promiseAllMapHelperWithoutHandle = async () => {
+  await Promise.all(items.map(async (item) => await computeRow(item)));
+};
+
+// The same per-row helper, mapped but never awaited as a fan-out: `.map()`
+// alone starts nothing this rule is about.
+export const mapHelperHandleWithoutFanOut = () => {
+  // oxlint-disable-next-line typescript/promise-function-async -- fixture: the callback must stay awaitless so the mapped array is the only product
+  const pending = items.map((item) => upsertRow(tx, item));
+  return pending.length;
+};
+
+// A literal array is fixed at author time, so it is bounded by construction.
+export const promiseAllLiteralArrayHelperHandle = async () => {
+  const first = items[0] ?? { id: "" };
+  await Promise.all([upsertRow(tx, first), upsertRow(ctx.tx, first)]);
 };

@@ -290,6 +290,12 @@ export const handleMcpToolCall = async ({
         {
           anonymizeTextFields:
             executionContext.testDependencies?.anonymizeTextFields,
+          loadAnonymizationAllowlistCanonicalsByWorkspace:
+            executionContext.testDependencies
+              ?.loadAnonymizationAllowlistCanonicalsByWorkspace,
+          loadAnonymizationGazetteerEntriesByWorkspace:
+            executionContext.testDependencies
+              ?.loadAnonymizationGazetteerEntriesByWorkspace,
         },
       );
     },

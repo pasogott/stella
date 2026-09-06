@@ -20,8 +20,9 @@ import { settleAll, settleAllCleanup } from "@/api/lib/corpus-index/core";
 import { ConcurrentModificationError } from "@/api/lib/errors/tagged-errors";
 import {
   cancelCaseLawCorpusUploadIntents,
-  completeCaseLawCorpusUploadIntentCleanup,
+  completeCaseLawCorpusUploadIntentCleanups,
 } from "@/api/lib/legal-search/case-law-corpus-upload-intents";
+import type { CancelledCaseLawCorpusUploadIntent } from "@/api/lib/legal-search/case-law-corpus-upload-intents";
 import { removeDecisionFromIndex } from "@/api/lib/legal-search/case-law-search-index";
 import { CorpusIndexError } from "@/api/lib/legal-search/corpus-index-client";
 import {
@@ -52,6 +53,57 @@ import {
  * personal text. `content_hash` is nulled so neither backfill loop
  * re-indexes the body. The erasure is recorded in case_law_index_jobs.
  */
+type EraseCancelledIntentObjectsOptions = {
+  cancelledIntents: readonly CancelledCaseLawCorpusUploadIntent[];
+  deleteCorpus?: typeof deleteCorpusDocument;
+};
+
+type CancelledIntentErasure = {
+  /** Intents whose every object is gone; only these may lose their row. */
+  cleanedIntentIds: SafeId<"caseLawCorpusUploadIntent">[];
+  /** Intents still holding a payload; their rows stay as retry targets. */
+  incomplete: {
+    intentId: SafeId<"caseLawCorpusUploadIntent">;
+    error: unknown;
+  }[];
+};
+
+/**
+ * Erase the objects of every cancelled upload intent and split the intents
+ * by outcome. A retained shared object or a failed DELETE keeps the intent
+ * on the retry path exactly as it keeps a decision's pointer columns.
+ */
+export const eraseCancelledIntentObjects = async ({
+  cancelledIntents,
+  deleteCorpus = deleteCorpusDocument,
+}: EraseCancelledIntentObjectsOptions): Promise<CancelledIntentErasure> => {
+  const erasures = await Promise.all(
+    cancelledIntents.map(async (intent) => ({
+      intentId: intent.id,
+      erasure: await eraseCorpusObjects({
+        keys: {
+          textKey: intent.textKey,
+          sectionsKey: intent.sectionsKey,
+          astKey: intent.astKey,
+        },
+        deleteCorpus,
+      }),
+    })),
+  );
+  const result: CancelledIntentErasure = {
+    cleanedIntentIds: [],
+    incomplete: [],
+  };
+  for (const { intentId, erasure } of erasures) {
+    if (erasure.type === "deleted") {
+      result.cleanedIntentIds.push(intentId);
+      continue;
+    }
+    result.incomplete.push({ intentId, error: erasure.error });
+  }
+  return result;
+};
+
 type RedactInput = {
   decisionId: SafeId<"caseLawDecision">;
   scopedDb: ScopedDb;
@@ -312,26 +364,36 @@ export const redactCaseLawDecision = async ({
     }
   }
 
-  const cancelledCleanup = await Promise.allSettled(
-    cancelledIntents.map(async (intent) => {
-      await deleteCorpusDocument({
-        textKey: intent.textKey,
-        sectionsKey: intent.sectionsKey,
-        astKey: intent.astKey,
-      });
-      await completeCaseLawCorpusUploadIntentCleanup({
-        intentId: intent.id,
+  // Reserved uploads cancelled under the decision lock go the same way as
+  // the decision's own payloads: only an intent whose objects are all gone
+  // loses its row, the rest stay retry targets. The batched row delete is
+  // failure-isolated the way the per-intent deletes it replaced were: a
+  // redaction that has already scrubbed the objects must go on to scrub the
+  // pointers and the index, and a retained cleanup row is a retry target,
+  // not a reason to stop.
+  const { cleanedIntentIds, incomplete } = await eraseCancelledIntentObjects({
+    cancelledIntents,
+    deleteCorpus,
+  });
+  for (const { error } of incomplete) {
+    captureError(error, {
+      decisionId,
+      step: "redactCaseLawDecision.deleteReservedCorpusUpload",
+    });
+  }
+  const intentCleanup = await Result.tryPromise({
+    try: async () =>
+      await completeCaseLawCorpusUploadIntentCleanups({
+        intentIds: cleanedIntentIds,
         scopedDb,
-      });
-    }),
-  );
-  for (const cleanup of cancelledCleanup) {
-    if (cleanup.status === "rejected") {
-      captureError(cleanup.reason, {
-        decisionId,
-        step: "redactCaseLawDecision.deleteReservedCorpusUpload",
-      });
-    }
+      }),
+    catch: (cause) => cause,
+  });
+  if (Result.isError(intentCleanup)) {
+    captureError(intentCleanup.error, {
+      decisionId,
+      step: "redactCaseLawDecision.completeReservedCorpusUploadCleanup",
+    });
   }
 
   // Clear pointers only once every object is gone; an incomplete erasure
@@ -407,6 +469,7 @@ export const redactCaseLawDecision = async ({
     try {
       const claimOutcomes = await Promise.allSettled(
         [...targets.keys()].sort().map(async (targetGeneration) => ({
+          // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- bounded fan-out: one lease per corpus generation, each with its own fencing token
           lease: await acquireCaseLawCorpusGenerationLease({
             generation: targetGeneration,
             scopedDb,
@@ -496,6 +559,7 @@ export const redactCaseLawDecision = async ({
       }
       await scopedDb(async (tx) => {
         for (const lease of leases.values()) {
+          // oxlint-disable-next-line no-db-await-in-loop/no-db-await-in-loop -- each lease renews under its own fencing token before the shared database mark
           await lease.beforeDatabaseMark(tx);
         }
         const stillErased = (

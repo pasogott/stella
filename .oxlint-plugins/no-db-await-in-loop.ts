@@ -14,6 +14,22 @@
 //     call whose callee resolves to `safeDb` — bare (`safeDb(cb)`, common in
 //     `createSafeHandler` generators) or as a property access
 //     (`ctx.safeDb(cb)`, `context.safeDb(cb)`).
+//   - A HANDLE await is an `AwaitExpression` whose argument is any other call
+//     that receives a database handle (`db`, `tx`, `safeDb`, `scopedDb`,
+//     `rootDb`, `ingestionDb`, `backfillDb`) as an argument: a bare identifier
+//     (`upsertRow(tx, row)`), a member access landing on or rooted at one
+//     (`upsertRow(ctx.tx, row)`), or an object-literal property carrying one
+//     by key, shorthand, or value (`helper({ tx, id })`,
+//     `helper({ database: tx })`), including through nested object literals.
+//     The query lives behind the helper, so no chain is rooted at the handle
+//     here — the handle in the argument list is the evidence. Function
+//     arguments are deliberately not scanned: a handle used inside a callback
+//     body runs wherever that callback runs, so
+//     `for (const r of rows) enqueue(() => save(tx, r))` enqueues rather than
+//     queries. The two shapes report distinct messages. Inside a
+//     `Promise.all(...)` / `Promise.allSettled(...)` fan-out the handle shape
+//     yields to the fan-out check below whenever that check already reports
+//     the same call, so one fan-out never costs two reports.
 //   - Safe handlers express the same operation as
 //     `yield* Result.await(safeDb(...))`; delegated `YieldExpression` nodes
 //     with that shape are treated as DB awaits too.
@@ -40,9 +56,15 @@
 //     argument does *not* match the rule above: is it `Promise.all(...)` /
 //     `Promise.allSettled(...)` wrapping a single `.map()` / `.forEach()` /
 //     `.flatMap()` call? If so, resolve that call's callback and look for a
-//     DB-rooted call chain *inside* it, without requiring an explicit
-//     `await` on it (a `Promise.all([...]).then` or bare-return callback
-//     still issues one query per item):
+//     database call *inside* it -- a DB-rooted chain, or a helper carrying a
+//     handle -- without requiring an explicit `await` on it (a
+//     `Promise.all([...]).then` or bare-return callback still issues one
+//     query per item, and `items.map((item) => upsertRow(tx, item))` has no
+//     inner await for the walk-up path to find at all). The fan-out reports
+//     whichever of the two messages matched. A literal array argument
+//     (`Promise.all([saveA(tx), saveB(tx)])`) is not matched: its length is
+//     fixed at author time, which is the bounded case the escape hatch is
+//     for.
 //       - Inline callback (`items.map((item) => tx.insert(...))`): scan its
 //         body for a DB-rooted call that is *not* already the direct
 //         argument of an `await` — that shape is already caught by rule #1
@@ -73,6 +95,7 @@
 //   await Promise.all(items.map(async (item) => { await tx.select()...; }));
 //   await Promise.allSettled(items.map(async (item) => { await tx...; }));
 //   await Promise.all(items.map((item) => tx.insert(t).values(item))); // no await in the callback
+//   await Promise.all(items.map((item) => upsertRow(tx, item)));        // handle behind a helper
 //   const indexRow = async (row) => { await tx.insert(t).values(row); };
 //   await Promise.all(chunk.map(indexRow));                             // named callback
 //
@@ -117,7 +140,37 @@ const FUNCTION_TYPES = new Set([
   "ArrowFunctionExpression",
 ]);
 
-const DB_ROOT_NAMES = new Set(["db", "tx"]);
+// Every identifier the codebase uses for a database handle: the Drizzle
+// client (`db`, `rootDb`), a transaction (`tx`), and the scoped or bounded
+// runners that take a callback (`safeDb`, `scopedDb`, `ingestionDb`,
+// `backfillDb`). One list, so the chain roots below and the argument scan
+// cannot drift apart.
+const DB_HANDLE_NAMES = [
+  "db",
+  "tx",
+  "safeDb",
+  "scopedDb",
+  "rootDb",
+  "ingestionDb",
+  "backfillDb",
+] as const;
+
+type DbHandleName = (typeof DB_HANDLE_NAMES)[number];
+
+const DB_HANDLE_NAME_SET: ReadonlySet<string> = new Set(DB_HANDLE_NAMES);
+
+// The handles a query chain is written directly on. The runner handles take a
+// callback (`scopedDb((tx) => ...)`) and never root a chain, so they are
+// matched as arguments instead. `satisfies` binds this subset to the list
+// above: a rename there fails to compile here.
+const DB_CHAIN_ROOT_NAMES = [
+  "db",
+  "tx",
+] as const satisfies readonly DbHandleName[];
+
+const DB_CHAIN_ROOT_NAME_SET: ReadonlySet<string> = new Set(
+  DB_CHAIN_ROOT_NAMES,
+);
 
 const MAP_LIKE_METHOD_NAMES = new Set(["map", "forEach", "flatMap"]);
 
@@ -169,7 +222,69 @@ const isDbAwaitCall = (node: unknown): boolean => {
     return true;
   }
   const root = resolveChainRootName(node);
-  return root !== null && DB_ROOT_NAMES.has(root);
+  return root !== null && DB_CHAIN_ROOT_NAME_SET.has(root);
+};
+
+// The database handle an argument carries, or null. Identifiers, member
+// accesses, and object literals are followed; functions are not (see the
+// header for why a handle inside a callback body is the call site's question,
+// not this one's).
+const findDbHandleInValue = (node: unknown): string | null => {
+  const value = unwrapExpression(node);
+  if (value === null) {
+    return null;
+  }
+  if (isIdentifier(value)) {
+    return DB_HANDLE_NAME_SET.has(value.name) ? value.name : null;
+  }
+  if (value.type === "MemberExpression") {
+    const propertyName = getPropertyName(getField(value, "property"));
+    if (propertyName !== null && DB_HANDLE_NAME_SET.has(propertyName)) {
+      return propertyName;
+    }
+    return findDbHandleInValue(getField(value, "object"));
+  }
+  if (value.type !== "ObjectExpression") {
+    return null;
+  }
+  const properties = getField(value, "properties");
+  if (!Array.isArray(properties)) {
+    return null;
+  }
+  for (const property of properties) {
+    if (getType(property) !== "Property") {
+      continue;
+    }
+    const keyName = isComputed(property)
+      ? null
+      : getPropertyName(getField(property, "key"));
+    if (keyName !== null && DB_HANDLE_NAME_SET.has(keyName)) {
+      return keyName;
+    }
+    const fromValue = findDbHandleInValue(getField(property, "value"));
+    if (fromValue !== null) {
+      return fromValue;
+    }
+  }
+  return null;
+};
+
+// The database handle a call receives, or null when it receives none.
+const findDbHandleArgument = (node: unknown): string | null => {
+  if (getType(node) !== "CallExpression") {
+    return null;
+  }
+  const args = getField(node, "arguments");
+  if (!Array.isArray(args)) {
+    return null;
+  }
+  for (const argument of args) {
+    const handle = findDbHandleInValue(argument);
+    if (handle !== null) {
+      return handle;
+    }
+  }
+  return null;
 };
 
 const getResultAwaitArgument = (node: unknown): unknown => {
@@ -325,54 +440,75 @@ const resolveLocalFunctionByName = (
   return null;
 };
 
-// Recursively scan `node` for a DB-rooted call chain. `canResolveFurther`
+// Which shape a database call inside a fan-out callback matched. A boolean
+// would lose the handle name the handle message reports, and the two shapes
+// are exactly the two messages this rule emits.
+type DatabaseCallMatch =
+  | { readonly kind: "chain" }
+  | { readonly kind: "handle"; readonly handle: string };
+
+const CHAIN_MATCH: DatabaseCallMatch = { kind: "chain" };
+
+// Recursively scan `node` for a database call: a DB-rooted call chain, or a
+// call carrying a database handle in its arguments. `canResolveFurther`
 // allows exactly one more hop through a bare function-call callee that
 // resolves to a same-file local definition (see `resolveLocalFunctionByName`
 // above); the hop is spent immediately so nested calls found through it
 // cannot chain into further hops. `viaResolution` marks that `node` was
 // already reached through such a hop (or is a resolved named `.map()`
-// callback's own body): once true, a DB-rooted call counts whether or not
+// callback's own body): once true, a database call counts whether or not
 // it is awaited, since no other check in this rule could have already
 // flagged it. When false (still scanning an inline callback's own body),
-// only a *bare* (non-awaited) DB-rooted call counts, so the existing
+// only a *bare* (non-awaited) call counts, so the existing
 // `AwaitExpression`-walk-up path keeps sole ownership of directly awaited
-// calls and the same fan-out isn't reported twice.
-const containsDbRootedCall = (
+// calls and the same fan-out isn't reported twice. `items.map((item) =>
+// upsertRow(tx, item))` has no inner await at all, so the fan-out scan is
+// the only thing that can see it.
+const findDatabaseCall = (
   node: unknown,
   canResolveFurther: boolean,
   viaResolution: boolean,
-): boolean => {
+): DatabaseCallMatch | null => {
   if (Array.isArray(node)) {
-    return node.some((child) =>
-      containsDbRootedCall(child, canResolveFurther, viaResolution),
-    );
+    for (const child of node) {
+      const match = findDatabaseCall(child, canResolveFurther, viaResolution);
+      if (match !== null) {
+        return match;
+      }
+    }
+    return null;
   }
   if (typeof node !== "object" || node === null) {
-    return false;
+    return null;
   }
   const type = getType(node);
   if (type === null) {
-    return false;
+    return null;
   }
 
-  if (type === "CallExpression") {
-    if (isDbAwaitCall(node) && isChainRoot(node)) {
-      if (viaResolution || !isAwaitArgument(node)) {
-        return true;
-      }
-      // A direct `await dbCall()` at the unresolved level belongs to the
-      // `AwaitExpression` visitor's own `isDbAwaitCall` check -- skip it
-      // here rather than reporting the same fan-out twice.
-    } else if (canResolveFurther) {
-      const callee = getField(node, "callee");
-      if (isIdentifier(callee)) {
-        const resolved = resolveLocalFunctionByName(node, callee.name);
-        if (
-          resolved !== null &&
-          containsDbRootedCall(getField(resolved, "body"), false, true)
-        ) {
-          return true;
-        }
+  if (type === "CallExpression" && isChainRoot(node)) {
+    const isChainCall = isDbAwaitCall(node);
+    const handle = isChainCall ? null : findDbHandleArgument(node);
+    // A direct `await dbCall()` / `await helper(tx, row)` at the unresolved
+    // level belongs to the `AwaitExpression` visitor -- skipping it here is
+    // what keeps one fan-out from being reported twice.
+    if (
+      (isChainCall || handle !== null) &&
+      (viaResolution || !isAwaitArgument(node))
+    ) {
+      return handle === null ? CHAIN_MATCH : { kind: "handle", handle };
+    }
+  }
+  if (type === "CallExpression" && canResolveFurther) {
+    const callee = getField(node, "callee");
+    if (isIdentifier(callee)) {
+      const resolved = resolveLocalFunctionByName(node, callee.name);
+      const match =
+        resolved === null
+          ? null
+          : findDatabaseCall(getField(resolved, "body"), false, true);
+      if (match !== null) {
+        return match;
       }
     }
   }
@@ -381,55 +517,78 @@ const containsDbRootedCall = (
     if (key === "parent") {
       continue;
     }
-    if (
-      containsDbRootedCall(
-        Reflect.get(node, key),
-        canResolveFurther,
-        viaResolution,
-      )
-    ) {
-      return true;
+    const match = findDatabaseCall(
+      Reflect.get(node, key),
+      canResolveFurther,
+      viaResolution,
+    );
+    if (match !== null) {
+      return match;
     }
   }
-  return false;
+  return null;
 };
 
 // Is `node` a `Promise.all(...)` / `Promise.allSettled(...)` call wrapping
 // a single `.map()` / `.forEach()` / `.flatMap()` call whose callback
 // (inline, or a same-file named function resolved by identifier) reaches a
-// DB-rooted call chain?
-const isPromiseAllMapFanOutWithDbCallback = (node: unknown): boolean => {
+// database call -- a DB-rooted chain, or a helper carrying a handle? Returns
+// the shape that matched, so the fan-out reports the same message the loop
+// path would.
+//
+// A literal array (`Promise.all([saveA(tx), saveB(tx)])`) is deliberately not
+// matched: its length is fixed at author time, which is the bounded case this
+// rule's escape hatch exists for.
+const findPromiseAllMapFanOutDatabaseCall = (
+  node: unknown,
+): DatabaseCallMatch | null => {
   if (!isPromiseAllLikeCall(node)) {
-    return false;
+    return null;
   }
   const args = getField(node, "arguments");
   if (!Array.isArray(args) || args.length !== 1) {
-    return false;
+    return null;
   }
   const mapCall = unwrapExpression(args[0]);
   if (!isMapLikeCall(mapCall)) {
-    return false;
+    return null;
   }
 
   const mapArgs = getField(mapCall, "arguments");
   if (!Array.isArray(mapArgs) || mapArgs.length === 0) {
-    return false;
+    return null;
   }
   const callback = unwrapExpression(mapArgs.at(-1));
 
   if (isFunctionNode(callback)) {
-    return containsDbRootedCall(getField(callback, "body"), true, false);
+    return findDatabaseCall(getField(callback, "body"), true, false);
   }
 
   if (isIdentifier(callback)) {
     const resolved = resolveLocalFunctionByName(mapCall, callback.name);
-    if (resolved === null) {
-      return false;
-    }
-    return containsDbRootedCall(getField(resolved, "body"), true, true);
+    return resolved === null
+      ? null
+      : findDatabaseCall(getField(resolved, "body"), true, true);
   }
 
-  return false;
+  return null;
+};
+
+// The `Promise.all(...)` / `Promise.allSettled(...)` call whose `.map()`
+// callback lexically encloses `node`, or null when no such callback does. Used
+// to hand a fan-out back to the check that owns it.
+const enclosingFanOutCall = (node: unknown): unknown => {
+  let current = getField(node, "parent");
+  while (current !== null && current !== undefined) {
+    const type = getType(current);
+    if (type !== null && FUNCTION_TYPES.has(type)) {
+      return isPromiseAllMapCallback(current)
+        ? getField(getField(current, "parent"), "parent")
+        : null;
+    }
+    current = getField(current, "parent");
+  }
+  return null;
 };
 
 // Walk up from an `AwaitExpression`, stopping at the first loop body or
@@ -480,6 +639,13 @@ export default eslintCompatPlugin({
             "outside the loop. If the loop is genuinely bounded (a small " +
             "compile-time constant list), disable with a `// SAFETY:` note " +
             "explaining the bound.",
+          noDbHandleAwaitInLoop:
+            "Awaited call receives the database handle `{{handle}}` inside a " +
+            "loop, so the query behind it runs once per iteration (N+1). " +
+            "Hand the whole set (ids, rows) to a batched helper that issues " +
+            "one statement, or await once outside the loop. If the iteration " +
+            "is inherently sequential (a cursor walk, a page loop, an ordered " +
+            "write), disable with a `-- <reason>` note saying why.",
         },
       },
       createOnce(context) {
@@ -493,9 +659,42 @@ export default eslintCompatPlugin({
             }
             return;
           }
-          if (isPromiseAllMapFanOutWithDbCallback(argument)) {
-            context.report({ node, messageId: "noDbAwaitInLoop" });
+          const fanOut = findPromiseAllMapFanOutDatabaseCall(argument);
+          if (fanOut !== null) {
+            context.report(
+              fanOut.kind === "handle"
+                ? {
+                    node,
+                    messageId: "noDbHandleAwaitInLoop",
+                    data: { handle: fanOut.handle },
+                  }
+                : { node, messageId: "noDbAwaitInLoop" },
+            );
+            return;
           }
+          const handle = findDbHandleArgument(argument);
+          if (handle === null) {
+            return;
+          }
+          const loopContext = findLoopOrMapContext(node);
+          if (loopContext === null) {
+            return;
+          }
+          if (
+            loopContext === "promise-all-map" &&
+            findPromiseAllMapFanOutDatabaseCall(enclosingFanOutCall(node)) !==
+              null
+          ) {
+            // The fan-out check above already reports this `Promise.all(...)`
+            // on its own await. Reporting here too would name one fan-out
+            // twice and cost it two suppressions.
+            return;
+          }
+          context.report({
+            node,
+            messageId: "noDbHandleAwaitInLoop",
+            data: { handle },
+          });
         };
 
         return {

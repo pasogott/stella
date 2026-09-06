@@ -23,7 +23,6 @@ import {
   CHAT_TRANSPORT_ERROR_CODE,
 } from "@stll/anonymize-chat";
 
-import type { ScopedDb } from "@/api/db/safe-db";
 import {
   createChatAttachmentPart,
   toPersistableChatMessage,
@@ -117,10 +116,6 @@ const stripTimestamps = (chunks: readonly StreamChunk[]) =>
     void timestamp;
     return rest;
   });
-
-const scopedDb: ScopedDb = async () => {
-  throw new Error("Expected stream deanonymization test not to access DB");
-};
 
 describe("tool-call history pruning", () => {
   test("drops partial calls while retaining resumable and terminal calls", () => {
@@ -2289,7 +2284,6 @@ const createBoundary = (
   placeholderOffsets: new Map<string, number>(),
   literalPlaceholderAliases: new Map<string, string>(),
   redactionMap: new Map(pairs),
-  scopedDb,
   sourcePlaceholders: new Set<string>(),
   type: "anonymized",
 });
