@@ -234,11 +234,32 @@ describe("scoreAuthoringRun", () => {
     ).toBe("partial");
   });
 
-  test("a provider error outranks everything, and no call is its own outcome", () => {
-    expect(
-      scoreAuthoringRun({ turnError: "refused", attempt: savedAttempt() })
-        .outcome,
-    ).toBe("error");
+  test("a provider error overrides the outcome without discarding saved diagnostics", () => {
+    const providerError = scoreAuthoringRun({
+      turnError: "provider refused the request",
+      attempt: {
+        ...savedAttempt(),
+        paths: { missing: ["company"], extra: [] },
+        configDefects: ["company has no lookup"],
+      },
+    });
+    expect(providerError.outcome).toBe("error");
+    expect(providerError.note).toBe("provider refused the request");
+    expect(providerError.paths.missing).toEqual(["company"]);
+    expect(providerError.configDefects).toEqual(["company has no lookup"]);
+  });
+
+  test("a provider error with no attempt has no diagnostics", () => {
+    const providerError = scoreAuthoringRun({
+      turnError: "provider refused the request",
+      attempt: null,
+    });
+    expect(providerError.outcome).toBe("error");
+    expect(providerError.note).toBe("provider refused the request");
+    expect(providerError.paths).toEqual({ missing: [], extra: [] });
+  });
+
+  test("no call without a provider error is its own outcome", () => {
     expect(scoreAuthoringRun({ turnError: null, attempt: null }).outcome).toBe(
       "no-call",
     );
@@ -260,6 +281,51 @@ describe("scoreAuthoringRun", () => {
     });
     expect(rejected.outcome).toBe("partial");
     expect(rejected.overlayIssues).toEqual(['No field "x"']);
+  });
+
+  test("an unsaved document earns partial credit for its authored markers", () => {
+    const score = scoreAuthoringRun({
+      turnError: null,
+      attempt: {
+        status: "unsaved",
+        paths: { missing: [], extra: [] },
+        traps: detectGrammarTraps({
+          blocks: [paragraph("Hello {{name}}")],
+          overlay: [],
+          booleanInputPaths: [],
+        }),
+        overlayIssues: [],
+        fidelity: [],
+      },
+    });
+
+    expect(score.outcome).toBe("partial");
+    expect(score.paths).toEqual({ missing: [], extra: [] });
+    expect(Object.values(score.traps).every((count) => count === 0)).toBe(true);
+    expect(score.note).toBe("authored DOCX was not saved");
+  });
+
+  test("an unsaved document keeps its evidence when the turn errors", () => {
+    const score = scoreAuthoringRun({
+      turnError: "output token limit reached",
+      attempt: {
+        status: "unsaved",
+        paths: { missing: ["signing_date"], extra: [] },
+        traps: detectGrammarTraps({
+          blocks: [paragraph("{{#each attorneys}}"), paragraph("{{name}}")],
+          overlay: [],
+          booleanInputPaths: [],
+        }),
+        overlayIssues: [],
+        fidelity: ['dropped "POWER OF ATTORNEY"'],
+      },
+    });
+
+    expect(score.outcome).toBe("error");
+    expect(score.note).toBe("output token limit reached");
+    expect(score.paths.missing).toEqual(["signing_date"]);
+    expect(score.traps.unprefixed_item_path).toBe(1);
+    expect(score.fidelity).toEqual(['dropped "POWER OF ATTORNEY"']);
   });
 });
 

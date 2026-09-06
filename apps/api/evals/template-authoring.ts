@@ -37,7 +37,12 @@
  *   fidelity      source wording the template dropped instead of keeping
  *   round trip    leftover `{{`, blank repeated rows, a conditional row that
  *                 was not dropped, a date outside its requested locale
+ *   error         exact provider or stream error for the run
  *   tokens, ms
+ *
+ * A valid `write_docx` result still earns marker, grammar and fidelity credit
+ * when the turn ends before `save_template`; it remains a partial outcome
+ * because configuration and the fill round trip never completed.
  *
  * The `syntax-quiz` task has no DOCX: eight grammar questions answered as one
  * JSON object, scored exactly. Its wrong answers are reported in the
@@ -140,9 +145,9 @@ const DEFAULT_MODELS = [
 const DEFAULT_RUNS = 1;
 // Every run is a paid request; keep a typo from turning into a bill.
 const MAX_RUNS = 20;
-// A whole document plus its field overlay, with room for a reasoning model's
-// thinking tokens, which share this budget.
-const MAX_OUTPUT_TOKENS = 24_000;
+// A whole document plus its field overlay and the following save call, with
+// room for a reasoning model's thinking tokens, which share this budget.
+const MAX_OUTPUT_TOKENS = 48_000;
 const MAX_ITERATIONS = 10;
 const MODEL_REQUEST_TIMEOUT_MS = 240_000;
 
@@ -1173,13 +1178,16 @@ const WRITE_DOCX_DESCRIPTION =
   "it expands to the file's base64 bytes at the boundary.";
 
 type ToolTrace = { name: string; input: unknown };
+type WrittenDocx = { ref: string; blocks: AuthoredBlock[]; buffer: Buffer };
 
 const createAuthoringTools = ({
   trace,
   saveCalls,
+  writeCalls,
 }: {
   trace: ToolTrace[];
   saveCalls: SaveCall[];
+  writeCalls: WrittenDocx[];
 }): AnyServerTool[] => {
   const written = new Map<string, Buffer>();
 
@@ -1204,6 +1212,7 @@ const createAuthoringTools = ({
         : { type: "table", rows: block.rows },
     );
     const buffer = await buildDocx(authored);
+    writeCalls.push({ ref, blocks: authored, buffer });
     written.set(ref, buffer);
     return { docx_ref: ref, bytes: buffer.byteLength };
   });
@@ -1420,6 +1429,8 @@ type EvalRun = {
   taskId: string;
   repeat: number;
   score: AuthoringRunScore;
+  /** Exact provider or stream error for this run, retained in JSON output. */
+  error: string | null;
   calls: number;
   quiz: { correct: number; total: number } | null;
   latencyMs: number;
@@ -1480,6 +1491,42 @@ const buildAttempt = async ({
   };
 };
 
+const buildUnsavedAttempt = async ({
+  blocks,
+  buffer,
+  task,
+  overlayIssues,
+}: {
+  blocks: readonly AuthoredBlock[];
+  buffer: Buffer;
+  task: EvalTask;
+  overlayIssues: readonly string[];
+}): Promise<SaveAttempt> => {
+  const discovered = await discoverTemplate(buffer);
+  const paths = mergeManifestWithDiscovery(null, discovered).map(
+    (field) => field.path,
+  );
+  return {
+    status: "unsaved",
+    paths: comparePaths(task.expectedPaths, paths),
+    traps: detectGrammarTraps({
+      blocks,
+      overlay: [],
+      booleanInputPaths: task.booleanInputPaths,
+    }),
+    overlayIssues: [
+      ...overlayIssues,
+      ...discovered.structureErrors.map(
+        (error) => `${error.directive}: ${error.message}`,
+      ),
+    ],
+    fidelity: checkSourceFidelity({
+      authored: authoredParagraphs(blocks),
+      preservedPhrases: task.preservedPhrases,
+    }),
+  };
+};
+
 const runAuthoringTask = async ({
   model,
   modelId,
@@ -1494,7 +1541,8 @@ const runAuthoringTask = async ({
   const organizationId = mintAuthProviderId<"organization">();
   const trace: ToolTrace[] = [];
   const saveCalls: SaveCall[] = [];
-  const tools = createAuthoringTools({ trace, saveCalls });
+  const writeCalls: WrittenDocx[] = [];
+  const tools = createAuthoringTools({ trace, saveCalls, writeCalls });
   const sourceDocx = await buildDocx(task.source);
   const prompt = [
     task.brief,
@@ -1522,20 +1570,45 @@ const runAuthoringTask = async ({
       last === undefined
         ? null
         : v.safeParse(SAVE_TEMPLATE_DEFINITION.inputSchemaSource, last.input);
-    const attempt: SaveAttempt | null =
-      parsed === null
-        ? null
-        : {
-            status: "rejected",
-            overlayIssues: parsed.success
-              ? ["save_template call never reached the handler"]
-              : validationIssues(parsed.issues),
-          };
+    let overlayIssues: string[];
+    if (parsed === null) {
+      overlayIssues = [];
+    } else if (parsed.success) {
+      overlayIssues = ["save_template call never reached the handler"];
+    } else {
+      overlayIssues = validationIssues(parsed.issues);
+    }
+    // A rejected raw save can name an earlier write. Score that exact
+    // document; using the most recent write would attach its diagnostics to a
+    // different attempted save. With no save attempt, the last authored
+    // document remains the only available partial evidence.
+    let authored: WrittenDocx | undefined;
+    if (last === undefined) {
+      authored = writeCalls.at(-1);
+    } else if (parsed?.success) {
+      const ref = parsed.output.docx_base64;
+      if (ref !== undefined) {
+        authored = writeCalls.findLast((written) => written.ref === ref.trim());
+      }
+    }
+
+    let attempt: SaveAttempt | null;
+    if (authored === undefined) {
+      attempt = parsed === null ? null : { status: "rejected", overlayIssues };
+    } else {
+      attempt = await buildUnsavedAttempt({
+        blocks: authored.blocks,
+        buffer: authored.buffer,
+        task,
+        overlayIssues,
+      });
+    }
     return {
       modelId,
       taskId: task.id,
       repeat,
       score: scoreAuthoringRun({ turnError: turn.error, attempt }),
+      error: turn.error,
       calls: raw.length,
       quiz: null,
       latencyMs: turn.latencyMs,
@@ -1555,6 +1628,7 @@ const runAuthoringTask = async ({
     taskId: task.id,
     repeat,
     score: scoreAuthoringRun({ turnError: turn.error, attempt }),
+    error: turn.error,
     calls: saveCalls.length,
     quiz: null,
     latencyMs: turn.latencyMs,
@@ -1616,6 +1690,7 @@ const runSyntaxQuiz = async ({
     taskId: SYNTAX_QUIZ_TASK_ID,
     repeat,
     score,
+    error: turn.error,
     calls: answers.length,
     quiz: { correct: quiz.correct, total: quiz.total },
     latencyMs: turn.latencyMs,
@@ -1629,7 +1704,12 @@ const runSyntaxQuiz = async ({
 // ── Report ────────────────────────────────────────────────
 
 const cell = (values: readonly string[]): string =>
-  values.length === 0 ? "-" : values.join("; ").replaceAll("|", "\\|");
+  values.length === 0
+    ? "-"
+    : values
+        .join("; ")
+        .replaceAll(/\r\n|\r|\n/gu, "<br>")
+        .replaceAll("|", "\\|");
 
 const trapsCell = (traps: GrammarTrapCounts): string =>
   cell(
@@ -1659,8 +1739,8 @@ const renderReport = (runs: readonly EvalRun[]): string => {
     const modelRuns = runs.filter((run) => run.modelId === modelId);
     lines.push(`\n### ${modelId}\n`);
     lines.push(
-      "| task | run | outcome | calls | missing | extra | traps | overlay | config | fidelity | round trip | tokens | ms |",
-      "| --- | ---: | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: |",
+      "| task | run | outcome | error | calls | missing | extra | traps | overlay | config | fidelity | round trip | tokens | ms |",
+      "| --- | ---: | --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- | ---: | ---: |",
     );
     for (const run of modelRuns) {
       const { score } = run;
@@ -1669,6 +1749,7 @@ const renderReport = (runs: readonly EvalRun[]): string => {
           `| ${run.taskId}`,
           String(run.repeat),
           score.outcome,
+          run.error === null ? "-" : cell([run.error]),
           String(run.calls),
           cell(score.paths.missing),
           cell(score.paths.extra),
