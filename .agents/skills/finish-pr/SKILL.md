@@ -45,9 +45,16 @@ valid reviews, or bypass protections merely to make the PR green.
 Never request an automated review (`@coderabbitai review`, `@codex review`, or a
 timed re-request after a rate limit); reviews arrive on their own. Budget the loop:
 at most two review rounds after the first green head. When actionable findings keep
-arriving past that, keep the green head, triage the remaining findings yourself
-with a concrete accept or push-back, and land accepted fixes in one stacked
-follow-up PR instead of pushing to the converged head.
+arriving past that, keep the green head and triage the remaining findings yourself
+with a concrete accept, push-back, or defer. Open one stacked follow-up PR for the
+accepted fixes, then reply to each deferred finding with that PR's URL, and resolve
+the thread where the finding has one: the named follow-up is the disposition, not a
+promise. A deferred top-level comment stays open; the reply is its terminal state.
+
+The budget never defers a release-blocking defect. A finding that names a
+security, authorization, data-loss, or data-corruption defect, and survives
+verification, is fixed on this head however late it arrives: shipping a known
+defect to keep a round count is the outcome the budget exists to avoid.
 
 ## 4. Stop at a Real Terminal State
 
@@ -55,7 +62,10 @@ The latest pushed head has converged only when:
 
 - required CI is green
 - automated reviewers are terminal, not pending
-- no actionable bot thread remains unresolved
+- no actionable automated finding remains in a review thread or a top-level
+  comment: each is implemented, already addressed, pushed back with evidence,
+  or deferred to a named follow-up PR, and no verified release-blocking defect
+  was deferred
 - no unresolved human request for changes remains
 - no blocking review or merge conflict remains
 
