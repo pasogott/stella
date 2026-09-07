@@ -34,6 +34,7 @@ import {
   reopenCorpusProjectionCleanupTx,
   settleCorpusProjectionCleanupTx,
 } from "@/api/lib/legal-search/corpus-index-projection-cleanup-store";
+import { CORPUS_INDEX_APPEND_CANCEL_REASON } from "@/api/lib/legal-search/corpus-index-projection-contract";
 import { advanceCorpusProjectionDesiredStateTx } from "@/api/lib/legal-search/corpus-index-projection-desired-state";
 import {
   corpusIndexAppendPublishDelayMs,
@@ -107,6 +108,42 @@ const setDatabaseClock = async (now: Date): Promise<void> => {
       LANGUAGE sql
       VOLATILE
       AS $$ SELECT '${now.toISOString()}'::timestamptz $$
+    `),
+  );
+};
+
+/**
+ * A clock that moves between reads. Anything that reads it once per
+ * transaction sees `first`; a second read inside the same transaction sees
+ * `later`, which is how a statement that re-evaluates `clock_timestamp()`
+ * gives itself away.
+ */
+const setAdvancingDatabaseClock = async (
+  first: Date,
+  later: Date,
+): Promise<void> => {
+  await db.execute(
+    sql.raw(
+      `CREATE TABLE IF NOT EXISTS public.test_clock_reads (reads integer NOT NULL)`,
+    ),
+  );
+  await db.execute(sql.raw(`DELETE FROM public.test_clock_reads`));
+  await db.execute(sql.raw(`INSERT INTO public.test_clock_reads VALUES (0)`));
+  await db.execute(
+    sql.raw(`
+      CREATE OR REPLACE FUNCTION public.clock_timestamp()
+      RETURNS timestamptz
+      LANGUAGE plpgsql
+      VOLATILE
+      AS $$
+      DECLARE read_count integer;
+      BEGIN
+        UPDATE public.test_clock_reads SET reads = reads + 1 RETURNING reads INTO read_count;
+        RETURN CASE
+          WHEN read_count <= 1 THEN '${first.toISOString()}'::timestamptz
+          ELSE '${later.toISOString()}'::timestamptz
+        END;
+      END $$
     `),
   );
 };
@@ -1289,6 +1326,139 @@ test("one append request receives one post-lock database timestamp", async () =>
   ).toEqual([
     { appendStartedAt: requestStartedAt },
     { appendStartedAt: requestStartedAt },
+  ]);
+});
+
+const reserveOneLease = async (reservedAt: Date, leaseMs = 60_000) => {
+  const leases = await db.transaction(
+    async (tx) =>
+      await reserveCorpusProjectionIntentsTx(asTestRaw<Transaction>(tx), {
+        family: "case_law",
+        generation: "case_law_v5",
+        limit: 1,
+        leaseMs,
+        testNow: reservedAt,
+        newIntentId: () => FIRST_INTENT_ID,
+        newLeaseToken: () => FIRST_LEASE_TOKEN,
+      }),
+  );
+  return leases.at(0) ?? panic("Expected one reserved projection lease");
+};
+
+const readCancelReason = async () =>
+  await db
+    .select({ lastError: corpusIndexProjectionIntents.lastError })
+    .from(corpusIndexProjectionIntents)
+    .where(eq(corpusIndexProjectionIntents.id, FIRST_INTENT_ID));
+
+test("an append start past the lease deadline records the expiry, not drift", async () => {
+  const lease = await reserveOneLease(new Date("2026-08-25T12:00:00.000Z"));
+
+  expect(
+    await db.transaction(
+      async (tx) =>
+        await startCorpusProjectionAppendBatchTx(asTestRaw<Transaction>(tx), {
+          leases: [lease],
+          testNow: new Date("2026-08-25T12:02:00.000Z"),
+        }),
+    ),
+  ).toEqual([{ intentId: lease.intentId, status: "stale_cancelled" }]);
+  // The desired state never moved, so naming it here would send the next
+  // diagnosis after epoch churn that did not happen.
+  expect(await readCancelReason()).toEqual([
+    { lastError: CORPUS_INDEX_APPEND_CANCEL_REASON.leaseExpired },
+  ]);
+});
+
+test("an append start under a moved desired state records the drift", async () => {
+  const lease = await reserveOneLease(new Date("2026-08-25T12:00:00.000Z"));
+  await db.transaction(async (tx) => {
+    await tx
+      .update(caseLawDecisions)
+      .set({ court: "Moved desired state court" })
+      .where(eq(caseLawDecisions.id, DECISION_ID));
+    return await advanceCorpusProjectionDesiredStateTx(
+      asTestRaw<Transaction>(tx),
+      { family: "case_law", entityId: DECISION_ID },
+    );
+  });
+
+  expect(
+    await db.transaction(
+      async (tx) =>
+        await startCorpusProjectionAppendBatchTx(asTestRaw<Transaction>(tx), {
+          leases: [lease],
+          testNow: new Date("2026-08-25T12:00:10.000Z"),
+        }),
+    ),
+  ).toEqual([{ intentId: lease.intentId, status: "stale_cancelled" }]);
+  expect(await readCancelReason()).toEqual([
+    { lastError: CORPUS_INDEX_APPEND_CANCEL_REASON.desiredStateChanged },
+  ]);
+});
+
+test("a single append start past the lease deadline records the expiry", async () => {
+  const lease = await reserveOneLease(new Date("2026-08-25T12:00:00.000Z"));
+
+  expect(
+    await db.transaction(
+      async (tx) =>
+        await startCorpusProjectionAppendTx(asTestRaw<Transaction>(tx), {
+          intentId: lease.intentId,
+          leaseToken: lease.leaseToken,
+          testNow: new Date("2026-08-25T12:02:00.000Z"),
+        }),
+    ),
+  ).toBe("stale_cancelled");
+  expect(await readCancelReason()).toEqual([
+    { lastError: CORPUS_INDEX_APPEND_CANCEL_REASON.leaseExpired },
+  ]);
+});
+
+test("a rejected append start reads one clock, so a later expiry cannot take the blame", async () => {
+  const lease = await reserveOneLease(new Date("2026-08-25T12:00:00.000Z"));
+  await db.transaction(async (tx) => {
+    await tx
+      .update(caseLawDecisions)
+      .set({ court: "Raced desired state court" })
+      .where(eq(caseLawDecisions.id, DECISION_ID));
+    return await advanceCorpusProjectionDesiredStateTx(
+      asTestRaw<Transaction>(tx),
+      { family: "case_law", entityId: DECISION_ID },
+    );
+  });
+  // The start attempt is rejected while the lease is still live; the lease
+  // then lapses before the cancellation runs. Reading the clock twice would
+  // report the expiry and lose the desired-state change that actually
+  // rejected it.
+  const rejectedAt = new Date("2026-08-25T12:00:10.000Z");
+  await setAdvancingDatabaseClock(
+    rejectedAt,
+    new Date("2026-08-25T12:02:00.000Z"),
+  );
+
+  expect(
+    await withDatabaseClock(
+      async (tx) =>
+        await startCorpusProjectionAppendTx(tx, {
+          intentId: lease.intentId,
+          leaseToken: lease.leaseToken,
+        }),
+    ),
+  ).toBe("stale_cancelled");
+  expect(
+    await db
+      .select({
+        lastError: corpusIndexProjectionIntents.lastError,
+        cancelledAt: corpusIndexProjectionIntents.cancelledAt,
+      })
+      .from(corpusIndexProjectionIntents)
+      .where(eq(corpusIndexProjectionIntents.id, FIRST_INTENT_ID)),
+  ).toEqual([
+    {
+      lastError: CORPUS_INDEX_APPEND_CANCEL_REASON.desiredStateChanged,
+      cancelledAt: rejectedAt,
+    },
   ]);
 });
 

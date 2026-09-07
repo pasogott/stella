@@ -1,5 +1,15 @@
 import { panic } from "better-result";
-import { and, asc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  eq,
+  inArray,
+  isNotNull,
+  lte,
+  or,
+  sql,
+  type SQL,
+} from "drizzle-orm";
 
 import type { Transaction } from "@/api/db/root";
 import {
@@ -9,7 +19,10 @@ import {
 } from "@/api/db/schema";
 import { createSafeId, type SafeId } from "@/api/lib/branded-types";
 import type { CorpusFamily } from "@/api/lib/legal-search/corpus-generation-contract";
-import type { CorpusIndexProjectionFailureKind } from "@/api/lib/legal-search/corpus-index-projection-contract";
+import {
+  CORPUS_INDEX_APPEND_CANCEL_REASON,
+  type CorpusIndexProjectionFailureKind,
+} from "@/api/lib/legal-search/corpus-index-projection-contract";
 import {
   lockActiveCorpusProjectionManifestForMutation,
   lockRegisteredCorpusProjectionManifestForMutation,
@@ -469,6 +482,25 @@ export const prepareCorpusProjectionReplacementsTx = async <
   return cleanups.filter(({ intentId }) => updatedIds.has(intentId));
 };
 
+/**
+ * Which half of the start predicate rejected this reserved revision. Both
+ * cancel paths read it off the row instead of naming a reason at the call
+ * site, so the two causes cannot be filed under one message again.
+ * PostgreSQL evaluates a SET expression against the pre-update row, so the
+ * lease read here is still the one the start attempt tested.
+ *
+ * The parameter is a settled `Date`, never a SQL expression: the caller must
+ * have read one clock for the start attempt and this cancellation, or the two
+ * statements would compare the same lease against two different instants.
+ */
+const appendCancelReason = (transitionAt: Date): SQL<string> =>
+  sql<string>`CASE
+    WHEN ${corpusIndexProjectionIntents.leaseExpiresAt} IS NULL
+      OR ${corpusIndexProjectionIntents.leaseExpiresAt} <= ${transitionAt}::timestamptz
+    THEN ${CORPUS_INDEX_APPEND_CANCEL_REASON.leaseExpired}
+    ELSE ${CORPUS_INDEX_APPEND_CANCEL_REASON.desiredStateChanged}
+  END`;
+
 type StartCorpusProjectionAppendOptions = {
   intentId: ProjectionIntentId;
   leaseToken: string;
@@ -530,7 +562,11 @@ export const startCorpusProjectionAppendTx = async (
   if (lockedIntents.length === 0) {
     return "lease_lost";
   }
-  const transitionAt = testNow ?? sql<Date>`clock_timestamp()`;
+  // One clock for the start attempt and the cancellation that reads why it
+  // failed. `clock_timestamp()` is volatile, so leaving it in the statements
+  // would let a lease that was live when the start was rejected read as
+  // expired a moment later and take the blame from the desired state.
+  const transitionAt = testNow ?? (await readPostgresClock(tx));
   const rows = await tx
     .update(corpusIndexProjectionIntents)
     .set({
@@ -568,7 +604,7 @@ export const startCorpusProjectionAppendTx = async (
       leaseToken: null,
       leaseExpiresAt: null,
       cancelledAt: transitionAt,
-      lastError: "projection desired state changed before append",
+      lastError: appendCancelReason(transitionAt),
       updatedAt: transitionAt,
     })
     .where(
@@ -703,7 +739,7 @@ export const startCorpusProjectionAppendBatchTx = async (
       leaseToken: null,
       leaseExpiresAt: null,
       cancelledAt: transitionAt,
-      lastError: "projection desired state changed before append",
+      lastError: appendCancelReason(transitionAt),
       updatedAt: transitionAt,
     })
     .where(
